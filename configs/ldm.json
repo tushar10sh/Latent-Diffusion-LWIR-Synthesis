@@ -49,6 +49,10 @@
   "val_every": 2000,
   "save_every": 5000,
 
+  "_swath_geometry": "Real-world sensor swath widths — used by SceneAdaptiveInference at deployment",
+  "mwir_swath_km": 3.0,
+  "lwir_swath_km": 2.0,
+
   "_inference_defaults": {
     "guidance_scale": 5.0,
     "num_steps": 50,

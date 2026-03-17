@@ -41,6 +41,10 @@
   "save_every": 5000,
   "val_ddim_steps": 20,
 
+  "_swath_geometry": "Real-world sensor swath widths — used by SceneAdaptiveInference at deployment",
+  "mwir_swath_km": 3.0,
+  "lwir_swath_km": 2.0,
+
   "_tuning_notes": {
     "heterogeneity": "Increase lambda_cfc (0.1→0.3) if LWIR still looks blurry on homogeneous scenes",
     "artifacts": "Reduce lr to 5e-5 or add more dropout if you see checkerboard patterns",

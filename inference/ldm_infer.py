@@ -229,43 +229,105 @@ def run_ldm_inference(
     dit_ckpt: str,
     mwir_path: str,
     output_path: str,
-    lwir_gt_path: Optional[str] = None,
+    lwir_path: Optional[str] = None,       # real LWIR overlap strip for SAI, or GT for metrics
     image_size: int = 256,
     guidance_scale: float = 5.0,
     num_steps: int = 50,
     device: str = 'cuda',
+    # ── Scene-adaptive options ──────────────────────────────────
+    mwir_swath_km: float = 0.0,
+    lwir_swath_km: float = 0.0,
+    use_histogram_cal: bool = True,
+    use_scene_finetuning: bool = False,
+    finetune_steps: int = 100,
+    finetune_lr: float = 1e-4,
+    lora_r: int = 4,
+    scene_id: str = 'scene',
 ):
     pipeline = LDMInference(vae_ckpt, dit_ckpt, guidance_scale, num_steps, device=device)
 
-    # Load and normalise MWIR
+    # Load raw arrays
     mwir_arr = np.load(mwir_path).astype(np.float32)
     if mwir_arr.ndim == 2:
-        mwir_arr = mwir_arr[None]
-    mwir_norm = np.stack([percentile_normalize(mwir_arr[c]) for c in range(mwir_arr.shape[0])])
-    mwir_t = torch.from_numpy(mwir_norm).unsqueeze(0).to(pipeline.device)
+        mwir_arr = mwir_arr[np.newaxis]
 
-    print(f"[Inference] MWIR: {mwir_t.shape}, guidance={guidance_scale}, steps={num_steps}")
-
-    if mwir_t.shape[-2] <= image_size and mwir_t.shape[-1] <= image_size:
-        # Resize to training resolution
-        mwir_t = F.interpolate(mwir_t, size=(image_size, image_size), mode='bilinear', align_corners=False)
-        result = pipeline.sample(mwir_t)
-    else:
-        result = pipeline.sample_large(mwir_t, patch_size=image_size)
+    lwir_arr = None
+    if lwir_path:
+        lwir_arr = np.load(lwir_path).astype(np.float32)
+        if lwir_arr.ndim == 2:
+            lwir_arr = lwir_arr[np.newaxis]
 
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    np.save(out.with_suffix('.npy'), result.squeeze().cpu().numpy())
+
+    use_sai = (mwir_swath_km > 0 and lwir_swath_km > 0 and lwir_arr is not None)
+
+    if use_sai:
+        # ── Scene-Adaptive Inference path ────────────────────────
+        from inference.scene_adaptive import SceneAdaptiveInference
+
+        def generate_fn(mwir_t: torch.Tensor) -> torch.Tensor:
+            """Wraps LDMInference.sample / sample_large as a simple callable."""
+            if mwir_t.shape[-2] <= image_size and mwir_t.shape[-1] <= image_size:
+                mwir_resized = F.interpolate(
+                    mwir_t, size=(image_size, image_size),
+                    mode='bilinear', align_corners=False,
+                )
+                return pipeline.sample(mwir_resized, verbose=False)
+            else:
+                return pipeline.sample_large(mwir_t, patch_size=image_size, verbose=False)
+
+        sai = SceneAdaptiveInference(
+            model=pipeline.dit,            # SAI's LoRA injection targets the DiT
+            scheduler=pipeline.scheduler,
+            generate_fn=generate_fn,
+            mwir_swath_km=mwir_swath_km,
+            lwir_swath_km=lwir_swath_km,
+            use_histogram_cal=use_histogram_cal,
+            use_scene_finetuning=use_scene_finetuning,
+            finetune_steps=finetune_steps,
+            finetune_lr=finetune_lr,
+            lora_r=lora_r,
+            device=device,
+            output_dir=str(out.parent),
+        )
+        result = sai.run(
+            mwir_raw=mwir_arr,
+            lwir_raw=lwir_arr,
+            scene_id=scene_id,
+        )
+        np.save(out.with_suffix('.npy'), result['lwir_full'].astype(np.float32))
+        print(f"[LDM+SAI] Full swath saved → {out.with_suffix('.npy')}")
+        return
+
+    # ── Standard inference path (unchanged) ──────────────────────
+    mwir_norm = np.stack(
+        [percentile_normalize(mwir_arr[c]) for c in range(mwir_arr.shape[0])]
+    )
+    mwir_t = torch.from_numpy(mwir_norm).unsqueeze(0).to(pipeline.device)
+    print(f"[Inference] MWIR: {mwir_t.shape}, guidance={guidance_scale}, steps={num_steps}")
+
+    if mwir_t.shape[-2] <= image_size and mwir_t.shape[-1] <= image_size:
+        mwir_t = F.interpolate(
+            mwir_t, size=(image_size, image_size), mode='bilinear', align_corners=False
+        )
+        result_t = pipeline.sample(mwir_t)
+    else:
+        result_t = pipeline.sample_large(mwir_t, patch_size=image_size)
+
+    np.save(out.with_suffix('.npy'), result_t.squeeze().cpu().numpy())
     print(f"[Inference] Saved → {out.with_suffix('.npy')}")
 
-    if lwir_gt_path:
-        lwir_gt = np.load(lwir_gt_path).astype(np.float32)
-        if lwir_gt.ndim == 2: lwir_gt = lwir_gt[None]
-        lwir_norm = np.stack([percentile_normalize(lwir_gt[c]) for c in range(lwir_gt.shape[0])])
+    if lwir_arr is not None:
+        lwir_norm = np.stack(
+            [percentile_normalize(lwir_arr[c]) for c in range(lwir_arr.shape[0])]
+        )
         lwir_t = torch.from_numpy(lwir_norm).unsqueeze(0).to(pipeline.device)
-        if lwir_t.shape[-2:] != result.shape[-2:]:
-            lwir_t = F.interpolate(lwir_t, size=result.shape[-2:], mode='bilinear', align_corners=False)
-        metrics = compute_metrics(result, lwir_t)
+        if lwir_t.shape[-2:] != result_t.shape[-2:]:
+            lwir_t = F.interpolate(
+                lwir_t, size=result_t.shape[-2:], mode='bilinear', align_corners=False
+            )
+        metrics = compute_metrics(result_t, lwir_t)
         print("\n[Metrics]")
         for k, v in metrics.items():
             print(f"  {k:>14s}: {v}")
@@ -275,17 +337,45 @@ def run_ldm_inference(
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='LDM MWIR→LWIR Inference')
-    parser.add_argument('--vae_ckpt', required=True)
-    parser.add_argument('--dit_ckpt', required=True)
-    parser.add_argument('--mwir', required=True)
-    parser.add_argument('--output', required=True)
-    parser.add_argument('--lwir_gt', default=None)
-    parser.add_argument('--image_size', type=int, default=256)
-    parser.add_argument('--guidance_scale', type=float, default=5.0)
-    parser.add_argument('--num_steps', type=int, default=50)
-    parser.add_argument('--device', default='cuda')
+    parser.add_argument('--vae_ckpt',          required=True)
+    parser.add_argument('--dit_ckpt',          required=True)
+    parser.add_argument('--mwir',              required=True)
+    parser.add_argument('--output',            required=True)
+    parser.add_argument('--lwir',              default=None,
+                        help='Real LWIR .npy — overlap strip for SAI, or full-swath GT for metrics')
+    parser.add_argument('--image_size',        type=int,   default=256)
+    parser.add_argument('--guidance_scale',    type=float, default=5.0)
+    parser.add_argument('--num_steps',         type=int,   default=50)
+    parser.add_argument('--device',            default='cuda')
+    # ── Scene-adaptive options ──────────────────────────────────
+    parser.add_argument('--mwir_swath_km',     type=float, default=0.0,
+                        help='MWIR swath width in km. Set >0 with --lwir to enable SAI.')
+    parser.add_argument('--lwir_swath_km',     type=float, default=0.0,
+                        help='LWIR swath width in km.')
+    parser.add_argument('--no_histogram_cal',  action='store_true')
+    parser.add_argument('--scene_finetune',    action='store_true')
+    parser.add_argument('--finetune_steps',    type=int,   default=100)
+    parser.add_argument('--finetune_lr',       type=float, default=1e-4)
+    parser.add_argument('--lora_r',            type=int,   default=4)
+    parser.add_argument('--scene_id',          default='scene')
     args = parser.parse_args()
+
     run_ldm_inference(
-        args.vae_ckpt, args.dit_ckpt, args.mwir, args.output,
-        args.lwir_gt, args.image_size, args.guidance_scale, args.num_steps, args.device
+        vae_ckpt=args.vae_ckpt,
+        dit_ckpt=args.dit_ckpt,
+        mwir_path=args.mwir,
+        output_path=args.output,
+        lwir_path=args.lwir,
+        image_size=args.image_size,
+        guidance_scale=args.guidance_scale,
+        num_steps=args.num_steps,
+        device=args.device,
+        mwir_swath_km=args.mwir_swath_km,
+        lwir_swath_km=args.lwir_swath_km,
+        use_histogram_cal=not args.no_histogram_cal,
+        use_scene_finetuning=args.scene_finetune,
+        finetune_steps=args.finetune_steps,
+        finetune_lr=args.finetune_lr,
+        lora_r=args.lora_r,
+        scene_id=args.scene_id,
     )
