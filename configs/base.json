@@ -1,0 +1,54 @@
+{
+  "_comment": "Base config for MWIR→LWIR diffusion synthesis. Tune for your GPU memory.",
+
+  "data_root": "data/ir_pairs",
+  "file_ext": "npy",
+  "output_dir": "runs/mwir2lwir",
+
+  "mwir_channels": 1,
+  "lwir_channels": 1,
+  "image_size": 256,
+  "val_frac": 0.1,
+
+  "base_channels": 128,
+  "channel_mults": [1, 2, 4, 8],
+  "attn_resolutions": [16, 8],
+  "num_res_blocks": 2,
+  "dropout": 0.1,
+  "use_cross_attn": true,
+
+  "num_train_timesteps": 1000,
+  "noise_schedule": "cosine",
+  "prediction_type": "epsilon",
+  "clip_sample": true,
+
+  "lambda_cfc": 0.1,
+  "lambda_spectral": 0.05,
+  "cfc_patch_size": 16,
+
+  "lr": 1e-4,
+  "weight_decay": 1e-4,
+  "batch_size": 8,
+  "num_workers": 4,
+  "total_steps": 200000,
+  "warmup_steps": 1000,
+  "ema_decay": 0.9999,
+  "use_amp": true,
+  "use_lcn": false,
+
+  "log_every": 50,
+  "val_every": 2000,
+  "save_every": 5000,
+  "val_ddim_steps": 20,
+
+  "_tuning_notes": {
+    "heterogeneity": "Increase lambda_cfc (0.1→0.3) if LWIR still looks blurry on homogeneous scenes",
+    "artifacts": "Reduce lr to 5e-5 or add more dropout if you see checkerboard patterns",
+    "speed": "Set num_res_blocks=1, base_channels=64 for fast experimentation",
+    "memory": "Reduce batch_size or image_size; use gradient_checkpointing=true (add to Trainer)",
+    "large_images": "Use patch inference at test time with overlap=0.25"
+  },
+  "vis_n_samples": 8,
+  "vis_seed": 42,
+  "vis_every": 100
+}

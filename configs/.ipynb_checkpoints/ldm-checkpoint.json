@@ -1,0 +1,69 @@
+{
+  "_version": "LDM — VAE + Conditional DiT",
+  "_architecture": "Stage 1: KL-VAE (f=4) fine-tuned on LWIR | Stage 2: DiT-B/4 conditioned on MWIR",
+
+  "data_root": "data/ir_pairs",
+  "file_ext": "npy",
+  "output_dir": "runs/mwir2lwir_ldm",
+
+  "mwir_channels": 1,
+  "lwir_channels": 1,
+  "image_size": 256,
+  "val_frac": 0.1,
+  "num_workers": 8,
+
+  "_stage1_vae": "Fine-tune KL-VAE on LWIR imagery",
+  "sd_vae_path": "/data/tushar/LWIR-Synth/lwir-synth-ldm-v01/pretrained_weights/sd_vae/diffusion_pytorch_model.safetensors",
+  "vae_ch": 128,
+  "vae_ch_mult": [1, 2, 4],
+  "vae_num_res_blocks": 2,
+  "z_channels": 4,
+  "vae_f": 4,
+  "vae_lr": 4.5e-6,
+  "vae_batch_size": 16,
+  "vae_total_steps": 50000,
+  "kl_weight_start": 1e-7,
+  "kl_weight_max": 1e-4,
+  "kl_warmup_steps": 10000,
+
+  "_stage2_dit": "Conditional DiT-B/4 in latent space",
+  "dit_size": "B",
+  "dit_context_dim": 512,
+  "dit_cond_dim": 1024,
+  "num_registers": 4,
+  "dit_lr": 1e-4,
+  "dit_batch_size": 8,
+  "dit_total_steps": 200000,
+  "warmup_steps": 2000,
+  "ema_decay": 0.9999,
+  "cfg_prob": 0.1,
+
+  "num_train_timesteps": 1000,
+  "noise_schedule": "cosine",
+
+  "lambda_cfc": 0.10,
+  "lambda_spectral": 0.05,
+  "weight_decay": 1e-4,
+
+  "log_every": 50,
+  "val_every": 2000,
+  "save_every": 5000,
+
+  "_inference_defaults": {
+    "guidance_scale": 5.0,
+    "num_steps": 50,
+    "note": "CFG scale 3-7 is the key knob at inference. Higher = sharper but less diverse."
+  },
+
+  "_tuning_for_500_2000_pairs": {
+    "vae_total_steps": "50k is sufficient if fine-tuning from SD. Increase to 100k if training from scratch.",
+    "dit_total_steps": "200k with heavy augmentation. Monitor val PSNR plateau.",
+    "cfg_prob": "0.1 (10%) is standard. Increase to 0.15 if CFG guidance is weak at inference.",
+    "guidance_scale": "Start at 3.0, increase to 7.0. Above 7 causes mode collapse.",
+    "dit_size": "B is recommended. Use S if PSNR is similar but training is slow.",
+    "vae_f": "f=4 preserves more texture than f=8 for IR. Do not change unless memory constrained."
+  },
+  "vis_n_samples": 8,
+  "vis_seed": 42,
+  "vis_every": 100
+}

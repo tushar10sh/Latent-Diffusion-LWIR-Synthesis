@@ -1,0 +1,418 @@
+"""
+Updated trainer integrating the four targeted improvements.
+This is a thin wrapper that patches the base Trainer — no full rewrite needed.
+
+Changes from base trainer:
+  1. ImprovedDiffusionLoss replaces DiffusionLoss
+  2. LinearMWIRtoLWIRPrior added as auxiliary head
+  3. GlobalSceneContextEncoder added + injected into UNet context
+  4. BridgeDiffusionScheduler used at inference time
+  5. Separate optimizer param groups (prior + scene encoder train faster)
+"""
+
+import json
+import time
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.cuda.amp import GradScaler, autocast
+from pathlib import Path
+
+from models.conditional_unet import ConditionalUNet
+from models.diffusion_scheduler import DDIMScheduler
+from models.targeted_improvements import (
+    ImprovedDiffusionLoss,
+    LinearMWIRtoLWIRPrior,
+    GlobalSceneContextEncoder,
+    BridgeDiffusionScheduler,
+)
+from training.trainer import EMA, psnr, ssim
+from data.dataset import build_dataloaders, MWIRLWIRDataset
+from training.visualizer import Visualizer
+
+
+class ImprovedTrainer:
+    """
+    Drop-in replacement for Trainer.
+    Integrates all four targeted fixes.
+    """
+
+    def __init__(self, config: dict):
+        self.cfg = config
+        self.device = torch.device(config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
+        self.output_dir = Path(config.get('output_dir', 'runs/mwir2lwir_v2'))
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.global_step = 0
+        self.epoch = 0
+
+        with open(self.output_dir / 'config.json', 'w') as f:
+            json.dump(config, f, indent=2)
+
+        # ── Core diffusion UNet (unchanged) ──
+        self.model = ConditionalUNet(
+            in_channels=config.get('lwir_channels', 1),
+            mwir_channels=config.get('mwir_channels', 1),
+            base_channels=config.get('base_channels', 128),
+            channel_mults=tuple(config.get('channel_mults', [1, 2, 4, 8])),
+            attn_resolutions=tuple(config.get('attn_resolutions', [16, 8])),
+            num_res_blocks=config.get('num_res_blocks', 2),
+            dropout=config.get('dropout', 0.1),
+            use_cross_attn=True,
+            image_size=config.get('image_size', 256),
+        ).to(self.device)
+
+        # ── FIX 3: Global scene context encoder ──
+        self.scene_encoder = GlobalSceneContextEncoder(
+            in_channels=config.get('mwir_channels', 1),
+            embed_dim=config.get('base_channels', 128) * 4,
+        ).to(self.device)
+
+        # ── FIX 4: Linear prior (bridge diffusion auxiliary head) ──
+        self.prior_net = LinearMWIRtoLWIRPrior(
+            in_channels=config.get('mwir_channels', 1),
+            out_channels=config.get('lwir_channels', 1),
+        ).to(self.device)
+
+        total_params = (
+            sum(p.numel() for p in self.model.parameters()) +
+            sum(p.numel() for p in self.scene_encoder.parameters()) +
+            sum(p.numel() for p in self.prior_net.parameters())
+        )
+        print(f"[Model] Total parameters: {total_params/1e6:.1f}M")
+
+        # ── Schedulers ──
+        self.scheduler = DDIMScheduler(
+            num_train_timesteps=config.get('num_train_timesteps', 1000),
+            schedule=config.get('noise_schedule', 'cosine'),
+            clip_sample=True,
+            prediction_type=config.get('prediction_type', 'epsilon'),
+        ).to(self.device)
+        self.bridge_scheduler = BridgeDiffusionScheduler(self.scheduler)
+
+        # ── FIX 1+2+3+4: Improved loss ──
+        self.criterion = ImprovedDiffusionLoss(
+            lambda_cfc=config.get('lambda_cfc', 0.15),
+            lambda_spectral=config.get('lambda_spectral', 0.10),
+            lambda_gram=config.get('lambda_gram', 0.05),
+            lambda_hist=config.get('lambda_hist', 0.05),
+            lambda_prior=config.get('lambda_prior', 0.10),
+        ).to(self.device)
+
+        self.ema = EMA(self.model, decay=config.get('ema_decay', 0.9999))
+
+        # Separate LR: prior + scene encoder train 5× faster
+        lr = config.get('lr', 1e-4)
+        self.optimizer = AdamW([
+            {'params': self.model.parameters(), 'lr': lr},
+            {'params': self.scene_encoder.parameters(), 'lr': lr * 5},
+            {'params': self.prior_net.parameters(), 'lr': lr * 5},
+        ], betas=(0.9, 0.999), weight_decay=config.get('weight_decay', 1e-4))
+
+        warmup = config.get('warmup_steps', 1000)
+        total = config.get('total_steps', 200_000)
+        self.lr_sched = SequentialLR(
+            self.optimizer,
+            schedulers=[
+                LinearLR(self.optimizer, 1e-4, 1.0, warmup),
+                CosineAnnealingLR(self.optimizer, T_max=total - warmup, eta_min=1e-6),
+            ],
+            milestones=[warmup],
+        )
+
+        self.use_amp = config.get('use_amp', True) and self.device.type == 'cuda'
+        self.scaler = GradScaler(enabled=self.use_amp)
+
+        self.train_loader, self.val_loader = build_dataloaders(
+            root=config['data_root'],
+            image_size=config.get('image_size', 256),
+            batch_size=config.get('batch_size', 8),
+            num_workers=config.get('num_workers', 4),
+            use_lcn=config.get('use_lcn', False),
+            val_frac=config.get('val_frac', 0.1),
+            file_ext=config.get('file_ext', 'npy'),
+        )
+
+        # Non-augmented datasets for deterministic visualisation samples
+        _ds_kwargs = dict(
+            root=config['data_root'],
+            image_size=config.get('image_size', 256),
+            use_lcn=config.get('use_lcn', False),
+            val_frac=config.get('val_frac', 0.1),
+            file_ext=config.get('file_ext', 'npy'),
+        )
+        self._train_ds = MWIRLWIRDataset(augment=False, split='train', **_ds_kwargs)
+        self._test_ds  = MWIRLWIRDataset(augment=False, split='val',   **_ds_kwargs)
+
+        self.visualizer = Visualizer(
+            train_dataset=self._train_ds,
+            test_dataset=self._test_ds,
+            n_samples=config.get('vis_n_samples', 8),
+            seed=config.get('vis_seed', 42),
+            device=str(self.device),
+        )
+        self._vis_every = config.get('vis_every', config.get('val_every', 2000))
+
+        self.log_path = self.output_dir / 'train_log.jsonl'
+
+    # ─── Training step ───────────────────────────────────────────
+
+    def train_step(self, batch):
+        mwir = batch['mwir'].to(self.device)  # (B, 1, H, W)
+        lwir = batch['lwir'].to(self.device)  # (B, 1, H, W)
+
+        self.optimizer.zero_grad(set_to_none=True)
+
+        with autocast(enabled=self.use_amp, dtype=torch.bfloat16):
+            # FIX 4: Get linear prior prediction for bridge + auxiliary loss
+            x_prior = self.prior_net(mwir)
+
+            # FIX 4: Use bridge forward process (start from prior, not pure noise)
+            t = torch.randint(0, self.scheduler.num_train_timesteps, (lwir.shape[0],), device=self.device)
+            noise = torch.randn_like(lwir)
+            xt, noise_added = self.bridge_scheduler.q_sample_bridge(lwir, x_prior.detach(), t, noise)
+
+            # FIX 3: Inject global scene context into UNet via expanded context
+            # We achieve this by adding scene embedding to the time embedding.
+            # The UNet's AdaGN uses the time embedding as context — we simply
+            # concatenate the scene vector before it reaches the model.
+            # This requires a small projection layer added here:
+            scene_ctx = self.scene_encoder(mwir)   # (B, ctx_dim)
+
+            # The UNet's time_embed produces (B, ctx_dim). We add scene context.
+            # Hook into the model by temporarily overriding time embed output:
+            noise_pred = self._forward_with_scene_ctx(xt, t, mwir, scene_ctx)
+
+            # Predict x0 from noise prediction for data-space losses
+            sqrt_a = self.scheduler._extract(self.scheduler.sqrt_alphas_cumprod, t, lwir.shape)
+            sqrt_1ma = self.scheduler._extract(self.scheduler.sqrt_one_minus_alphas_cumprod, t, lwir.shape)
+            x0_pred = (xt - sqrt_1ma * noise_pred) / (sqrt_a + 1e-8)
+            x0_pred = x0_pred.clamp(-1, 1)
+
+            total_loss, loss_dict = self.criterion(
+                noise_pred, noise_added,
+                x0_pred, lwir,
+                prior_pred=x_prior,
+            )
+
+        self.scaler.scale(total_loss).backward()
+        self.scaler.unscale_(self.optimizer)
+        nn.utils.clip_grad_norm_(
+            list(self.model.parameters()) +
+            list(self.scene_encoder.parameters()) +
+            list(self.prior_net.parameters()),
+            max_norm=1.0
+        )
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.lr_sched.step()
+        self.ema.update()
+
+        return loss_dict
+
+    def _forward_with_scene_ctx(
+        self,
+        xt: torch.Tensor,
+        t: torch.Tensor,
+        mwir: torch.Tensor,
+        scene_ctx: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Inject scene context by adding it to the timestep embedding
+        before the UNet processes it.
+
+        Implementation: temporarily monkey-patch the model's time_embed
+        to add scene_ctx, then restore. This avoids modifying the UNet
+        architecture for backward compatibility.
+        """
+        original_time_embed = self.model.time_embed
+
+        class SceneAugmentedTimeEmbed(nn.Module):
+            def __init__(self, base_embed, ctx):
+                super().__init__()
+                self.base = base_embed
+                self.ctx = ctx  # (B, dim)
+
+            def forward(self, t):
+                t_emb = self.base(t)
+                return t_emb + self.ctx
+
+        augmented = SceneAugmentedTimeEmbed(original_time_embed, scene_ctx)
+        self.model.time_embed = augmented
+        out = self.model(xt, t, mwir)
+        self.model.time_embed = original_time_embed
+        return out
+
+    # ─── Validation ──────────────────────────────────────────────
+
+    @torch.no_grad()
+    def validate(self, num_inference_steps: int = 20):
+        self.model.eval()
+        self.prior_net.eval()
+        psnr_vals, ssim_vals = [], []
+        val_loss = 0.0
+        n = 0
+
+        for batch in self.val_loader:
+            mwir = batch['mwir'].to(self.device)
+            lwir = batch['lwir'].to(self.device)
+            B = mwir.shape[0]
+
+            x_prior = self.prior_net(mwir)
+            t = torch.randint(0, self.scheduler.num_train_timesteps, (B,), device=self.device)
+            noise = torch.randn_like(lwir)
+            xt, noise_added = self.bridge_scheduler.q_sample_bridge(lwir, x_prior, t, noise)
+            scene_ctx = self.scene_encoder(mwir)
+            noise_pred = self._forward_with_scene_ctx(xt, t, mwir, scene_ctx)
+            loss, _ = self.criterion(noise_pred, noise_added)
+            val_loss += loss.item() * B
+
+            # Full bridge sampling for first batch
+            if n == 0:
+                x_prior_small = x_prior[:4]
+                mwir_small = mwir[:4]
+                scene_ctx_small = scene_ctx[:4]
+
+                generated = self.bridge_scheduler.ddim_sample_bridge(
+                    lambda xt, t, mwir: self._forward_with_scene_ctx(xt, t, mwir, scene_ctx_small),
+                    mwir_small, x_prior_small,
+                    shape=(min(4, B), lwir.shape[1], lwir.shape[2], lwir.shape[3]),
+                    num_inference_steps=num_inference_steps,
+                    device=str(self.device),
+                )
+                for i in range(generated.shape[0]):
+                    psnr_vals.append(psnr(generated[i:i+1], lwir[i:i+1]))
+                    ssim_vals.append(ssim(generated[i:i+1], lwir[i:i+1]))
+
+            n += B
+            if n >= 64:
+                break
+
+        self.model.train()
+        self.prior_net.train()
+        import numpy as np
+        return {
+            'val_loss': val_loss / n,
+            'psnr': float(np.mean(psnr_vals)) if psnr_vals else 0,
+            'ssim': float(np.mean(ssim_vals)) if ssim_vals else 0,
+        }
+
+    # ─── Main train loop ─────────────────────────────────────────
+
+    def train(self):
+        cfg = self.cfg
+        total_steps = cfg.get('total_steps', 200_000)
+        log_every = cfg.get('log_every', 50)
+        val_every = cfg.get('val_every', 2000)
+        save_every = cfg.get('save_every', 5000)
+
+        print(f"\n{'='*65}")
+        print(f"  MWIR→LWIR Improved Diffusion Training (v2)")
+        print(f"  Bridge Diffusion + Gram + Histogram + Scene Context")
+        print(f"{'='*65}\n")
+
+        self.model.train()
+        self.prior_net.train()
+        self.scene_encoder.train()
+        running = {}
+        t0 = time.time()
+
+        while self.global_step < total_steps:
+            for batch in self.train_loader:
+                if self.global_step >= total_steps:
+                    break
+
+                loss_dict = self.train_step(batch)
+                for k, v in loss_dict.items():
+                    running[k] = running.get(k, 0.0) + v
+
+                if (self.global_step + 1) % log_every == 0:
+                    elapsed = time.time() - t0
+                    avg = {k: v / log_every for k, v in running.items()}
+                    lr = self.optimizer.param_groups[0]['lr']
+                    print(
+                        f"Step {self.global_step+1:>7d} | "
+                        f"Total: {avg.get('total',0):.4f} | "
+                        f"MSE: {avg.get('mse',0):.4f} | "
+                        f"Gram: {avg.get('gram',0):.4f} | "
+                        f"Hist: {avg.get('hist',0):.4f} | "
+                        f"Prior: {avg.get('prior',0):.4f} | "
+                        f"LR: {lr:.2e} | "
+                        f"{log_every/elapsed:.1f} it/s"
+                    )
+                    with open(self.log_path, 'a') as f:
+                        import json
+                        f.write(json.dumps({'step': self.global_step+1, 'lr': lr, **{f'train/{k}': round(v, 6) for k, v in avg.items()}}) + '\n')
+                    running = {}
+                    t0 = time.time()
+
+                if (self.global_step + 1) % val_every == 0:
+                    val = self.validate()
+                    print(f"\n  [Val] Loss: {val['val_loss']:.4f} | PSNR: {val['psnr']:.2f} dB | SSIM: {val['ssim']:.4f}\n")
+
+                # ── Visualisation ──
+                if (self.global_step + 1) % self._vis_every == 0:
+                    self.model.eval()
+                    self.prior_net.eval()
+                    self.scene_encoder.eval()
+                    vis_psnr = self.visualizer.save_both(
+                        step=self.global_step + 1,
+                        generate_fn=self._generate_fn,
+                        output_dir=self.output_dir,
+                    )
+                    self.model.train()
+                    self.prior_net.train()
+                    self.scene_encoder.train()
+                    if self.visualizer.is_best(vis_psnr.get('test'), 'test'):
+                        self._save('best')
+
+                if (self.global_step + 1) % save_every == 0:
+                    self._save(f'step_{self.global_step+1:07d}')
+
+                self.global_step += 1
+            self.epoch += 1
+
+        self._save('final')
+        # Final visualisation
+        self.model.eval()
+        self.prior_net.eval()
+        self.scene_encoder.eval()
+        self.visualizer.save_both(
+            step=self.global_step + 1,
+            generate_fn=self._generate_fn,
+            output_dir=self.output_dir,
+        )
+
+    # ─── Generate function for Visualizer ────────────────────────
+
+    def _generate_fn(self, mwir: torch.Tensor) -> torch.Tensor:
+        """Bridge-DDIM sampling over the fixed visualiser batch."""
+        x_prior = self.prior_net(mwir)
+        scene_ctx = self.scene_encoder(mwir)
+        B, C, H, W = mwir.shape
+        return self.bridge_scheduler.ddim_sample_bridge(
+            model_fn=lambda xt, t, m: self._forward_with_scene_ctx(xt, t, m, scene_ctx),
+            mwir=mwir,
+            x_prior=x_prior,
+            shape=(B, C, H, W),
+            num_inference_steps=self.cfg.get('val_ddim_steps', 20),
+            device=str(self.device),
+        )
+
+    def _save(self, tag: str):
+        ckpt_dir = self.output_dir / 'checkpoints'
+        ckpt_dir.mkdir(exist_ok=True)
+        torch.save({
+            'step': self.global_step,
+            'model': self.model.state_dict(),
+            'scene_encoder': self.scene_encoder.state_dict(),
+            'prior_net': self.prior_net.state_dict(),
+            'ema': self.ema.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'config': self.cfg,
+        }, ckpt_dir / f'ckpt_{tag}.pt')
+        print(f"  [Checkpoint] → checkpoints/ckpt_{tag}.pt")
+        # Prune old periodic checkpoints; keep best and final untouched
+        if tag.startswith('step_'):
+            for old in sorted(ckpt_dir.glob('ckpt_step_*.pt'))[:-3]:
+                old.unlink()

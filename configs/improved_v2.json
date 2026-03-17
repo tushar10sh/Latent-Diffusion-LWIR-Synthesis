@@ -1,0 +1,71 @@
+{
+  "_version": "v2 — targeted improvements from screenshot analysis",
+  "_changes_from_base": [
+    "ImprovedDiffusionLoss: adds Gram + Histogram losses",
+    "BridgeDiffusionScheduler: starts from MWIR-derived prior, not pure noise",
+    "GlobalSceneContextEncoder: adds global thermal context to UNet",
+    "LinearMWIRtoLWIRPrior: auxiliary head trains alongside diffusion",
+    "lambda_cfc raised 0.10→0.15 (heterogeneity problem)",
+    "lambda_spectral raised 0.05→0.10 (edge blurring in row 3)"
+  ],
+
+  "data_root": "data/ir_pairs",
+  "file_ext": "npy",
+  "output_dir": "runs/mwir2lwir_v2",
+
+  "mwir_channels": 1,
+  "lwir_channels": 1,
+  "image_size": 256,
+  "val_frac": 0.1,
+
+  "base_channels": 128,
+  "channel_mults": [1, 2, 4, 8],
+  "attn_resolutions": [16, 8],
+  "num_res_blocks": 2,
+  "dropout": 0.1,
+  "use_cross_attn": true,
+
+  "num_train_timesteps": 1000,
+  "noise_schedule": "cosine",
+  "prediction_type": "epsilon",
+  "clip_sample": true,
+
+  "_loss_weights_rationale": {
+    "lambda_cfc":      "0.15 — raised from 0.10: primary fix for thermal homogenization",
+    "lambda_spectral": "0.10 — raised from 0.05: fixes edge blurring on roads/buildings",
+    "lambda_gram":     "0.05 — NEW: fixes intra-field texture collapse (row 2)",
+    "lambda_hist":     "0.05 — NEW: fixes road brightness offset (row 3)",
+    "lambda_prior":    "0.10 — NEW: trains the bridge prior network"
+  },
+  "lambda_cfc": 0.15,
+  "lambda_spectral": 0.10,
+  "lambda_gram": 0.05,
+  "lambda_hist": 0.05,
+  "lambda_prior": 0.10,
+
+  "lr": 1e-4,
+  "weight_decay": 1e-4,
+  "batch_size": 8,
+  "num_workers": 4,
+  "total_steps": 200000,
+  "warmup_steps": 1000,
+  "ema_decay": 0.9999,
+  "use_amp": true,
+  "use_lcn": false,
+
+  "log_every": 50,
+  "val_every": 2000,
+  "save_every": 5000,
+  "val_ddim_steps": 20,
+
+  "_tuning_notes": {
+    "if_fields_still_flat":    "Increase lambda_gram 0.05→0.10",
+    "if_roads_still_bright":   "Increase lambda_hist 0.05→0.15",
+    "if_edges_still_blurry":   "Increase lambda_spectral 0.10→0.20",
+    "if_training_unstable":    "Reduce lambda_gram first (Gram losses can spike early)",
+    "if_memory_tight":         "Reduce LocalTextureGramLoss patch_size 64→32"
+  },
+  "vis_n_samples": 8,
+  "vis_seed": 42,
+  "vis_every": 100
+}
