@@ -279,6 +279,7 @@ class ConditionalUNet(nn.Module):
     ):
         super().__init__()
         self.use_cross_attn = use_cross_attn
+        self.num_res_blocks = num_res_blocks          # stored for forward()
         context_dim = base_channels * 4  # timestep emb dim
 
         # Timestep embedding
@@ -292,9 +293,18 @@ class ConditionalUNet(nn.Module):
 
         # ── Encoder ──
         self.enc_blocks = nn.ModuleList()
-        self.enc_downs = nn.ModuleList()
-        self.enc_attns = nn.ModuleList()
-        channels = [base_channels]
+        self.enc_downs  = nn.ModuleList()
+        self.enc_attns  = nn.ModuleList()
+
+        # channels tracks skip-connection channel widths in push order.
+        # The decoder pops (num_res_blocks + 1) times per level in reverse,
+        # so we must push (num_res_blocks + 1) entries per level:
+        #   • num_res_blocks  entries: one after each res block
+        #   • 1 bridge entry:          the level's final feature, pushed
+        #                              BEFORE the downsample
+        # Exception: the last (deepest) level feeds the bottleneck directly
+        # and has no downsample, so it does not need a bridge entry.
+        channels = [base_channels]                    # stem output is first skip
         cur_channels = base_channels
         cur_res = image_size
 
@@ -308,7 +318,12 @@ class ConditionalUNet(nn.Module):
                     self.enc_attns.append(nn.Identity())
                 channels.append(out_c)
                 cur_channels = out_c
-            if level < len(channel_mults) - 1:
+
+            is_last = (level == len(channel_mults) - 1)
+            if not is_last:
+                # Bridge entry: pushed before downsampling, consumed by the
+                # "+1" decoder block at this resolution level.
+                channels.append(cur_channels)
                 self.enc_downs.append(Downsample(cur_channels))
                 cur_res //= 2
             else:
@@ -316,37 +331,48 @@ class ConditionalUNet(nn.Module):
 
         # ── Bottleneck ──
         self.mid_block1 = ResBlock(cur_channels, cur_channels, context_dim, dropout=dropout)
-        self.mid_attn = SelfAttentionBlock(cur_channels)
+        self.mid_attn   = SelfAttentionBlock(cur_channels)
         self.mid_block2 = ResBlock(cur_channels, cur_channels, context_dim, dropout=dropout)
 
         # ── Decoder ──
         self.dec_blocks = nn.ModuleList()
-        self.dec_ups = nn.ModuleList()
-        self.dec_attns = nn.ModuleList()
+        self.dec_ups    = nn.ModuleList()
+        self.dec_attns  = nn.ModuleList()
         self.cross_attns = nn.ModuleList() if use_cross_attn else None
 
-        # Build MWIR encoder channel sizes for cross-attn
-        mwir_enc_channels = [base_channels] + [base_channels * m for m in channel_mults[:-1]] + [base_channels * channel_mults[-1]]
+        # MWIR encoder channel sizes for cross-attn (one per decoder level)
+        mwir_enc_channels = (
+            [base_channels]
+            + [base_channels * m for m in channel_mults[:-1]]
+            + [base_channels * channel_mults[-1]]
+        )
 
         for level, mult in reversed(list(enumerate(channel_mults))):
             out_c = base_channels * mult
+            # num_res_blocks + 1 blocks per decoder level (the +1 consumes
+            # the bridge entry pushed by the corresponding encoder level)
             for i in range(num_res_blocks + 1):
-                skip_c = channels.pop()
+                skip_c = channels.pop()               # now always succeeds
                 self.dec_blocks.append(ResBlock(cur_channels + skip_c, out_c, context_dim, dropout=dropout))
                 if cur_res in attn_resolutions:
                     self.dec_attns.append(SelfAttentionBlock(out_c))
                 else:
                     self.dec_attns.append(nn.Identity())
                 if use_cross_attn:
-                    # cross-attn against MWIR encoder feature at this level
                     ctx_c = mwir_enc_channels[min(level, len(mwir_enc_channels) - 1)]
                     self.cross_attns.append(CrossModalAttention(out_c, ctx_c))
                 cur_channels = out_c
+
             if level > 0:
                 self.dec_ups.append(Upsample(cur_channels))
                 cur_res *= 2
             else:
                 self.dec_ups.append(nn.Identity())
+
+        assert len(channels) == 0, (
+            f"channels stack not fully consumed: {len(channels)} entries remain. "
+            "This is a bug in the UNet init — encoder pushes and decoder pops must balance."
+        )
 
         # Output
         self.out_norm = nn.GroupNorm(32, base_channels)
@@ -358,63 +384,72 @@ class ConditionalUNet(nn.Module):
         t: torch.Tensor,       # (B,) timestep indices
         mwir: torch.Tensor,    # (B, 1, H, W) conditioning MWIR
     ) -> torch.Tensor:
-        # Timestep context
-        ctx = self.time_embed(t)                         # (B, ctx_dim)
+        # ── Context vectors ──────────────────────────────────────
+        ctx        = self.time_embed(t)        # (B, context_dim)
+        mwir_feats = self.mwir_enc(mwir)       # list of (B, C, H, W) at decreasing resolutions
 
-        # MWIR multi-scale features
-        mwir_feats = self.mwir_enc(mwir)                 # list of feature maps
-
-        # Early fusion: concat MWIR at input
+        # ── Stem (early fusion) ───────────────────────────────────
         h = self.input_conv(torch.cat([x, mwir], dim=1))
 
-        # ── Encode ──
-        skips = [h]
-        blk_idx = 0
-        down_idx = 0
-        for level in range(len(self.enc_downs)):
-            num_res = len([b for b in self.enc_blocks]) // len(self.enc_downs)  # approx
-        # Iterate properly
-        blk_i = 0
+        # ── Encoder ──────────────────────────────────────────────
+        # Push the stem output as the very first skip.
+        skips   = [h]
+        blk_i   = 0
+
         for level_i, down in enumerate(self.enc_downs):
-            for _ in range(2):  # num_res_blocks (hardcoded for clarity)
-                if blk_i >= len(self.enc_blocks):
-                    break
+            is_last = (level_i == len(self.enc_downs) - 1)
+
+            # num_res_blocks res blocks — push a skip after each
+            for _ in range(self.num_res_blocks):
                 h = self.enc_blocks[blk_i](h, ctx)
-                h = self.enc_attns[blk_i](h) if not isinstance(self.enc_attns[blk_i], nn.Identity) else self.enc_attns[blk_i](h)
+                h = self.enc_attns[blk_i](h)
                 skips.append(h)
                 blk_i += 1
-            h = down(h)
 
-        # ── Bottleneck ──
+            # Bridge skip: push h BEFORE downsampling so the decoder's
+            # "+1" block at this resolution has a skip to consume.
+            # Only non-last levels actually downsample.
+            if not is_last:
+                skips.append(h)   # bridge — same tensor as last res block output
+                h = down(h)       # Downsample
+            # last level: down is nn.Identity(), no bridge needed
+
+        # ── Bottleneck ────────────────────────────────────────────
         h = self.mid_block1(h, ctx)
         h = self.mid_attn(h)
         h = self.mid_block2(h, ctx)
 
-        # ── Decode ──
-        dec_i = 0
-        up_i = 0
-        cross_i = 0
-        num_levels = len(self.dec_ups)
-        blks_per_level = (len(self.dec_blocks)) // num_levels
+        # ── Decoder ──────────────────────────────────────────────
+        num_levels   = len(self.enc_downs)
+        dec_i        = 0
+        cross_i      = 0
 
-        for level_i in range(num_levels):
-            for j in range(blks_per_level):
-                if dec_i >= len(self.dec_blocks):
-                    break
+        for level_i, up in enumerate(self.dec_ups):
+            # level_i=0 corresponds to the deepest (highest-channel) decoder level
+            # which is the mirror of the last encoder level.
+            enc_level = num_levels - 1 - level_i   # encoder level this mirrors
+
+            for j in range(self.num_res_blocks + 1):
                 skip = skips.pop()
-                h = torch.cat([h, skip], dim=1)
-                h = self.dec_blocks[dec_i](h, ctx)
-                h = self.dec_attns[dec_i](h) if not isinstance(self.dec_attns[dec_i], nn.Identity) else self.dec_attns[dec_i](h)
+                h    = torch.cat([h, skip], dim=1)
+                h    = self.dec_blocks[dec_i](h, ctx)
+                h    = self.dec_attns[dec_i](h)
+
                 if self.use_cross_attn and cross_i < len(self.cross_attns):
-                    mwir_feat_idx = min(num_levels - 1 - level_i, len(mwir_feats) - 1)
+                    # Use MWIR features from the matching encoder level.
+                    # mwir_feats is ordered coarsest-to-finest so index from end.
+                    mwir_feat_idx = min(enc_level, len(mwir_feats) - 1)
                     mwir_f = mwir_feats[mwir_feat_idx]
-                    # Resize MWIR feature to match h spatial dims if needed
                     if mwir_f.shape[-2:] != h.shape[-2:]:
-                        mwir_f = F.interpolate(mwir_f, size=h.shape[-2:], mode='bilinear', align_corners=False)
+                        mwir_f = F.interpolate(
+                            mwir_f, size=h.shape[-2:],
+                            mode='bilinear', align_corners=False,
+                        )
                     h = self.cross_attns[cross_i](h, mwir_f)
                     cross_i += 1
+
                 dec_i += 1
-            h = self.dec_ups[up_i](h)
-            up_i += 1
+
+            h = up(h)   # Upsample (or Identity at the shallowest level)
 
         return self.out_conv(F.silu(self.out_norm(h)))

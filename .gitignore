@@ -1,2 +1,8 @@
 data/ir_pairs
 pretrained_weights/sd_vae/diffusion_pytorch_model.safetensors
+runs/mwir2lwir_ldm/stage2_dit/dit_log.jsonl
+__pycache__/
+*.pyc
+*.patch
+*.jsonl
+*.pt

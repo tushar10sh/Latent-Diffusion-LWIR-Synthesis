@@ -196,8 +196,10 @@ class MWIRLWIRDataset(Dataset):
         self.aug = ThermalAugmentor()
 
         # Discover paired files
-        mwir_dir = self.root / 'MWIR-normalized-globalstats'
-        lwir_dir = self.root / 'LWIR-normalized-globalstats'
+        # mwir_dir = self.root / 'MWIR-normalized-globalstats'
+        # lwir_dir = self.root / 'LWIR-normalized-globalstats'
+        mwir_dir = self.root / 'MWIR'
+        lwir_dir = self.root / 'LWIR'
 
         all_mwir_files = sorted([
             f.stem for f in mwir_dir.iterdir()
@@ -216,6 +218,7 @@ class MWIRLWIRDataset(Dataset):
             mwir_files = all_mwir_files[:n - n_val - n_test]
             lwir_files = all_lwir_files[:n - n_val - n_test]
         elif split == 'val':
+            print(f"[MWIRLWIRDataset] val_fraction: {val_frac}")
             mwir_files = all_mwir_files[n - n_val - n_test: n - n_test]
             lwir_files = all_lwir_files[n - n_val - n_test: n - n_test]
         else:
@@ -225,7 +228,7 @@ class MWIRLWIRDataset(Dataset):
         self.mwir_paths = [mwir_dir / f'{f}.{file_ext}' for f in mwir_files]
         self.lwir_paths = [lwir_dir / f'{f}.{file_ext}' for f in lwir_files]
 
-        print(f"[Dataset] {split}: {len(all_mwir_files)} pairs found in {root}")
+        print(f"[Dataset] {split}: {len(lwir_files)} pairs found in {root}")
 
     def __len__(self):
         return len(self.mwir_paths)
@@ -318,7 +321,7 @@ class MWIRLWIRDataset(Dataset):
         return {
             'mwir': mwir.float(),          # (C, H, W), range ≈ [-1, 1]
             'lwir': lwir.float(),          # (C, H, W), range ≈ [-1, 1]
-            'path': str(self.mwir_paths[idx].stem),
+            'path': str(self.lwir_paths[idx].stem),
         }
 
 

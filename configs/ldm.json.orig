@@ -9,7 +9,6 @@
   "mwir_channels": 1,
   "lwir_channels": 1,
   "image_size": 256,
-  "_latent_dims": "256/4=64 → latent 64×64×4=16384 dims. DiT patch_size=4 → 16×16=256 patch tokens + 4 registers = 260 total.",
   "val_frac": 0.1,
   "num_workers": 8,
 
@@ -42,36 +41,9 @@
   "num_train_timesteps": 1000,
   "noise_schedule": "cosine",
 
-  "_flow_matching": "Flow Matching replaces DDPM — set use_flow_matching: false to revert to DDPM",
-  "use_flow_matching": true,
-  "fm_time_sampling": "logit_normal",
-  "fm_logit_loc": 0.0,
-  "fm_logit_scale": 1.0,
-  "fm_loss_weighting": "constant",
-
-  "snr_gamma": 5.0,
-
   "lambda_cfc": 0.10,
   "lambda_spectral": 0.05,
   "weight_decay": 1e-4,
-
-  "_planck_loss": "Fill in your actual calibration coefficients before enabling",
-  "planck": {
-    "lambda_planck": 0.05,
-    "mwir_wavelength_um": 4.0,
-    "lwir_wavelength_um": 10.0,
-    "mwir_gain":   0.01,
-    "mwir_offset": -0.5,
-    "lwir_gain":   0.005,
-    "lwir_offset": 200.0,
-    "mwir_norm_min": 88.0,
-    "mwir_norm_max": 3804.0,
-    "lwir_norm_min": 1622.0,
-    "lwir_norm_max": 3836.0,
-    "allowed_delta_K": 15.0,
-    "use_confidence": true,
-    "confidence_sigma": 2.0
-  },
 
   "log_every": 50,
   "val_every": 2000,

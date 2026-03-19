@@ -169,7 +169,15 @@ class SelfAttentionRoPE(nn.Module):
         self.k_norm = nn.RMSNorm(self.head_dim)
         self.rope = RotaryEmbedding2D(self.head_dim)
 
-    def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, H: int, W: int,
+                n_registers: int = 0) -> torch.Tensor:
+        """
+        x: (B, N_total, hidden_dim)  where N_total = n_registers + H*W
+
+        RoPE is spatial — it must be applied only to the H*W patch tokens.
+        Register tokens sit at positions [:n_registers] and have no spatial
+        meaning, so we slice them off, rotate the patch slice, then concat.
+        """
         q, k, v = self.to_qkv(x).chunk(3, dim=-1)
         q = rearrange(q, 'b n (h d) -> b h n d', h=self.num_heads)
         k = rearrange(k, 'b n (h d) -> b h n d', h=self.num_heads)
@@ -178,8 +186,19 @@ class SelfAttentionRoPE(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        q = self.rope(q, H, W)
-        k = self.rope(k, H, W)
+        if n_registers > 0:
+            # Split: register slice has no position, patch slice gets RoPE
+            q_reg,   q_patch   = q[:, :, :n_registers], q[:, :, n_registers:]
+            k_reg,   k_patch   = k[:, :, :n_registers], k[:, :, n_registers:]
+
+            q_patch = self.rope(q_patch, H, W)
+            k_patch = self.rope(k_patch, H, W)
+
+            q = torch.cat([q_reg, q_patch], dim=2)
+            k = torch.cat([k_reg, k_patch], dim=2)
+        else:
+            q = self.rope(q, H, W)
+            k = self.rope(k, H, W)
 
         out = F.scaled_dot_product_attention(q, k, v)
         return self.to_out(rearrange(out, 'b h n d -> b n (h d)'))
@@ -228,11 +247,13 @@ class DiTBlock(nn.Module):
         context: torch.Tensor,
         H: int,
         W: int,
+        n_registers: int = 0,
     ) -> torch.Tensor:
         x_sa, x_ff, gate_sa, gate_ff = self.adaln(x, c)
 
         # Self-attention (with adaLN-Zero gate)
-        x = x + gate_sa * self.self_attn(x_sa, H, W)
+        # n_registers tells SelfAttentionRoPE how many leading tokens to skip
+        x = x + gate_sa * self.self_attn(x_sa, H, W, n_registers=n_registers)
 
         # Cross-attention to MWIR (no gate — always active)
         x = self.cross_attn(x, context)
@@ -465,7 +486,7 @@ class ConditionalDiT(nn.Module):
 
         # DiT blocks
         for block in self.blocks:
-            x = block(x, c, ctx, pH, pW)
+            x = block(x, c, ctx, pH, pW, n_registers=self.num_registers)
 
         # Strip register tokens
         x = x[:, self.num_registers:, :]                   # (B, N, hidden_dim)

@@ -380,7 +380,11 @@ class IRVAE(nn.Module):
         self.z_channels = z_channels
         self.kl_weight = kl_weight
         self.kl_weight_max = kl_weight_max
-        self.scale_factor = 1.0   # set after training via compute_scale_factor()
+        # Both set by compute_scale_factor() after training.
+        # scale_factor = 1 / std(z_raw - latent_mean)
+        # latent_mean  = mean(z_raw)  — absorbs encoder bias
+        self.scale_factor = 1.0
+        self.latent_mean  = 0.0
 
         self.encoder = IREncoder(in_channels, ch, ch_mult, num_res_blocks, z_channels, dropout)
         self.decoder = IRDecoder(in_channels, ch, ch_mult, num_res_blocks, z_channels, dropout)
@@ -390,13 +394,60 @@ class IRVAE(nn.Module):
         h = self.encoder(x)
         return DiagonalGaussian(h)
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        return self.decoder(z / self.scale_factor)
+    def _get_affine(self, device: torch.device) -> tuple:
+        """
+        Return (mean_t, scale_t) as broadcastable tensors on `device`.
+        Handles both the old scalar format and the new per-channel list format,
+        so old checkpoints load without error.
+        """
+        mean  = self.latent_mean
+        scale = self.scale_factor
+
+        if isinstance(mean, (list, tuple)):
+            mean_t  = torch.tensor(mean,  dtype=torch.float32, device=device)
+            scale_t = torch.tensor(scale, dtype=torch.float32, device=device)
+            # Reshape to (1, C, 1, 1) for broadcasting against (B, C, H, W)
+            mean_t  = mean_t.view(1, -1, 1, 1)
+            scale_t = scale_t.view(1, -1, 1, 1)
+        else:
+            # Scalar fallback (old checkpoints)
+            mean_t  = torch.tensor(float(mean),  device=device)
+            scale_t = torch.tensor(float(scale), device=device)
+
+        return mean_t, scale_t
+
+    def encode_to_dit(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Encode x and return the per-channel-normalised latent the DiT trains on.
+
+            z_DiT[c] = (z_raw[c] - latent_mean[c]) * scale_factor[c]  →  N(0,1)
+        """
+        posterior = self.encode(x)
+        z_raw = posterior.sample()
+        mean_t, scale_t = self._get_affine(z_raw.device)
+        return (z_raw - mean_t) * scale_t
+
+    def decode(self, z_dit: torch.Tensor) -> torch.Tensor:
+        """
+        Decode a DiT-space latent back to pixel space.
+
+            z_raw[c] = z_dit[c] / scale_factor[c] + latent_mean[c]
+        """
+        mean_t, scale_t = self._get_affine(z_dit.device)
+        z_raw = z_dit / scale_t + mean_t
+        return self.decoder(z_raw)
 
     def forward(self, x: torch.Tensor, sample_posterior: bool = True):
+        """
+        VAE reconstruction round-trip (used only during VAE training).
+        The affine transform cancels in decode(encode_to_dit(x)), so
+        reconstruction quality is independent of calibration values.
+        """
         posterior = self.encode(x)
-        z = posterior.sample() if sample_posterior else posterior.mode()
-        recon = self.decode(z * self.scale_factor)
+        z_raw = posterior.sample() if sample_posterior else posterior.mode()
+        mean_t, scale_t = self._get_affine(z_raw.device)
+        z_dit = (z_raw - mean_t) * scale_t
+        recon = self.decode(z_dit)
         return recon, posterior
 
     def training_step(
@@ -422,22 +473,67 @@ class IRVAE(nn.Module):
         }
 
     @torch.no_grad()
-    def compute_scale_factor(self, dataloader, device: str = 'cuda', n_batches: int = 50):
+    def compute_scale_factor(self, dataloader, device: str = None, n_batches: int = 50):
         """
-        Empirically compute the std of the latent space and set scale_factor
-        so that z / scale_factor ~ N(0,1).
-        MUST be called after VAE training, before DiT training.
+        Compute affine normalisation parameters so that the latents fed to the
+        DiT are approximately N(0, 1) **per channel**.
+
+        Per-channel (not global) normalisation is used because IR latent spaces
+        are typically multimodal — different land cover types (water, vegetation,
+        urban, bare soil) encode to distinct clusters. A single global mean/std
+        falls in the trough between modes and inflates the std. Per-channel
+        statistics are robust to this structure.
+
+        Parameters stored:
+            latent_mean   : (z_channels,) per-channel mean  — shape (C,)
+            scale_factor  : (z_channels,) per-channel 1/std — shape (C,)
+
+        Encoding:  z_DiT[c] = (z_raw[c] - latent_mean[c]) * scale_factor[c]
+        Decoding:  z_raw[c] = z_DiT[c] / scale_factor[c] + latent_mean[c]
+
+        Device handling: the model must already be on the correct device before
+        calling this function (use vae.to(device) first). The `device` argument
+        is kept for backward compatibility but is now ignored — the model's own
+        device is used, eliminating the CPU/CUDA mismatch error.
         """
+        # Derive device from model weights — avoids CPU/CUDA type mismatch
+        model_device = next(self.parameters()).device
+
         self.eval()
-        stds = []
+        z_samples = []
         for i, batch in enumerate(dataloader):
             if i >= n_batches:
                 break
-            x = batch['lwir'].to(device)
-            z = self.encode(x).mode()
-            stds.append(z.std().item())
-        self.scale_factor = float(torch.tensor(stds).mean())
-        print(f"[VAE] Computed scale_factor = {self.scale_factor:.4f}")
+            x = batch['lwir'].to(model_device)
+            z = self.encode(x).mode()          # (B, C, H, W) — mode for stability
+            z_samples.append(z.cpu())
+
+        z_all = torch.cat(z_samples, dim=0)    # (N, C, H, W)
+
+        # Per-channel mean and std (averaged over batch B and spatial H×W)
+        # z_all: (N, C, H, W)  →  stats shape: (C,)
+        channel_mean = z_all.mean(dim=(0, 2, 3))          # (C,)
+        channel_std  = z_all.std(dim=(0, 2, 3)).clamp(min=1e-6)   # (C,) — prevent div/0
+
+        # Store as plain Python lists for JSON-serialisable checkpoints
+        self.latent_mean  = channel_mean.tolist()          # list[float] of length C
+        self.scale_factor = (1.0 / channel_std).tolist()  # list[float] of length C
+
+        # Verify: compute z_DiT statistics after normalisation
+        # z_DiT[c] = (z_all[c] - mean[c]) / std[c]
+        z_dit_check = (z_all - channel_mean[None, :, None, None]) \
+                      * (1.0 / channel_std)[None, :, None, None]
+        check_mean = z_dit_check.mean(dim=(0, 2, 3)).tolist()
+        check_std  = z_dit_check.std(dim=(0, 2, 3)).tolist()
+
+        print(f"[VAE] Per-channel latent calibration ({z_all.shape[1]} channels):")
+        for c in range(z_all.shape[1]):
+            print(
+                f"  ch{c}: raw_mean={channel_mean[c]:.4f}  raw_std={channel_std[c]:.4f}"
+                f"  →  z_DiT mean={check_mean[c]:.4f}  std={check_std[c]:.4f}"
+            )
+        print("[VAE] Calibration complete. z_DiT ~ N(0,1) per channel ✓")
+
         self.train()
         return self.scale_factor
 
