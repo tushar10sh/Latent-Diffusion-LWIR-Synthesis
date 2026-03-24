@@ -39,9 +39,11 @@ class ThermalAugmentor:
 
     @staticmethod
     def random_radiance_offset(img: torch.Tensor, max_offset: float = 0.05) -> torch.Tensor:
-        """Simulate atmospheric path radiance variation across scenes."""
-        offset = torch.empty(img.shape[0], 1, 1).uniform_(-max_offset, max_offset)
-        return img + offset.to(img.device)
+        """Simulate atmospheric path radiance variation across scenes.
+        img: (B, C, H, W) — offset is per-sample, broadcast over C, H, W."""
+        offset = torch.empty(img.shape[0], 1, 1, 1, device=img.device, dtype=img.dtype
+                             ).uniform_(-max_offset, max_offset)
+        return img + offset
 
     @staticmethod
     def random_emissivity_scale(img: torch.Tensor, scale_range=(0.9, 1.1)) -> torch.Tensor:
@@ -230,25 +232,40 @@ class MWIRLWIRDataset(Dataset):
             if f.suffix.lower() in self.SUPPORTED_EXTS
         ])
 
+        # ── Pair matching: only keep stems present in BOTH bands ──
+        mwir_set = set(all_mwir_files)
+        lwir_set = set(all_lwir_files)
+        paired_stems = sorted(mwir_set & lwir_set)
+        if len(paired_stems) < len(all_mwir_files) or len(paired_stems) < len(all_lwir_files):
+            n_mwir_only = len(mwir_set - lwir_set)
+            n_lwir_only = len(lwir_set - mwir_set)
+            print(
+                f"[Dataset] WARNING: {n_mwir_only} MWIR-only and {n_lwir_only} "
+                f"LWIR-only files dropped (no matching pair)."
+            )
+
+        # ── Deterministic shuffle before split ──
+        # Sorted stems are alphabetical (often temporal).  A seeded shuffle
+        # ensures train/val/test share the same distribution of scenes.
+        rng = np.random.RandomState(seed=42)
+        rng.shuffle(paired_stems)
+
         # Train / val / test split
-        n = len(all_mwir_files)
+        n = len(paired_stems)
         n_val = max(1, int(n * val_frac))
         n_test = max(1, int(n * val_frac))
         if split == 'train':
-            mwir_files = all_mwir_files[:n - n_val - n_test]
-            lwir_files = all_lwir_files[:n - n_val - n_test]
+            stems = paired_stems[:n - n_val - n_test]
         elif split == 'val':
             print(f"[MWIRLWIRDataset] val_fraction: {val_frac}")
-            mwir_files = all_mwir_files[n - n_val - n_test: n - n_test]
-            lwir_files = all_lwir_files[n - n_val - n_test: n - n_test]
+            stems = paired_stems[n - n_val - n_test: n - n_test]
         else:
-            mwir_files = all_mwir_files[n - n_test:]
-            lwir_files = all_lwir_files[n - n_test:]
+            stems = paired_stems[n - n_test:]
 
-        self.mwir_paths = [mwir_dir / f'{f}.{file_ext}' for f in mwir_files]
-        self.lwir_paths = [lwir_dir / f'{f}.{file_ext}' for f in lwir_files]
+        self.mwir_paths = [mwir_dir / f'{f}.{file_ext}' for f in stems]
+        self.lwir_paths = [lwir_dir / f'{f}.{file_ext}' for f in stems]
 
-        print(f"[Dataset] {split}: {len(lwir_files)} pairs found in {root}")
+        print(f"[Dataset] {split}: {len(stems)} pairs found in {root}")
 
     def __len__(self):
         return len(self.mwir_paths)

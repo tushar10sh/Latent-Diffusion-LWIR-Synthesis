@@ -143,8 +143,13 @@ def ensemble_inference(
     """
     Run multiple stochastic DDIM samples (eta > 0) and average.
     Returns (mean_prediction, std_prediction) — std is an uncertainty map.
+
+    Uses Welford's online algorithm to avoid storing all N samples in memory,
+    which would OOM on large images (e.g. 5 × 1 × 1024 × 1024 = 5.2 GB).
     """
-    samples = []
+    mean = torch.zeros(mwir.shape[0], 1, mwir.shape[2], mwir.shape[3],
+                        device=device)
+    m2 = torch.zeros_like(mean)
     for i in range(n_ensemble):
         s = scheduler.ddim_sample(
             model, mwir,
@@ -154,9 +159,12 @@ def ensemble_inference(
             device=device,
             verbose=False,
         )
-        samples.append(s)
-    stacked = torch.stack(samples, dim=0)
-    return stacked.mean(0), stacked.std(0)
+        delta = s - mean
+        mean += delta / (i + 1)
+        delta2 = s - mean
+        m2 += delta * delta2
+    variance = m2 / max(n_ensemble - 1, 1)
+    return mean, variance.sqrt()
 
 
 # ─────────────────────────────────────────────
