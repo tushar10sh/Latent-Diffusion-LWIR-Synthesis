@@ -185,6 +185,14 @@ class Trainer:
         precision = config.get('precision', 'float32')
         self.use_amp  = (precision == 'bfloat16') and (self.device.type == 'cuda')
         self.amp_dtype = torch.bfloat16 if self.use_amp else torch.float32
+
+        # GradScaler for mixed-precision training.
+        # NOTE: GradScaler is only useful with float16.  With bfloat16 it
+        # detects false inf/nan at its default 65536× scale and skips every
+        # optimizer step, so the model never trains.  We create it here
+        # (enabled=False for bfloat16/float32) so checkpoint save/load works.
+        self.scaler = GradScaler(self.device.type, enabled=(precision == 'float16'))
+
         if self.use_amp:
             print("[Trainer] Precision: bfloat16 (AMP enabled)")
         else:
