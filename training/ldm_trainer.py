@@ -30,6 +30,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.amp import GradScaler, autocast
 from pathlib import Path
 from typing import Optional
+import numpy as np
 
 from models.ldm.vae import IRVAE
 from models.ldm.dit import ConditionalDiT, DiT_B_4
@@ -256,7 +257,7 @@ class DiTTrainer:
         self.vae = vae.to(self.device).eval()
         for p in self.vae.parameters():
             p.requires_grad_(False)
-        if abs(self.vae.scale_factor - 1.0) < 1e-6:
+        if np.any(np.abs(self.vae.scale_factor - 1.0) < 1e-6):
             import warnings
             warnings.warn(
                 "[DiTTrainer] vae.scale_factor is still 1.0 (default). "
@@ -268,8 +269,8 @@ class DiTTrainer:
             )
         print(
             f"[DiT Trainer] VAE frozen. "
-            f"scale_factor={self.vae.scale_factor:.5f}  "
-            f"latent_mean={self.vae.latent_mean:.5f}"
+            f"scale_factor={self.vae.scale_factor}  "
+            f"latent_mean={self.vae.latent_mean}"
         )
 
         # DiT
