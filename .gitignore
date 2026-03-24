@@ -1,6 +1,11 @@
 data/ir_pairs
 pretrained_weights/sd_vae/diffusion_pytorch_model.safetensors
 runs/mwir2lwir_ldm/stage2_dit/dit_log.jsonl
+runs/mwir2lwir_ldm/stage2_dit/test-results
+runs/mwir2lwir_ldm/stage2_dit/train-results
+runs/mwir2lwir_ldm/stage2_dit/checkpoints
+runs/mwir2lwir
+runs/mwir2lwir_v2
 __pycache__/
 *.pyc
 *.patch

@@ -16,9 +16,8 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler, autocast
 from pathlib import Path
-from typing import Optional
 
 from models.conditional_unet import ConditionalUNet
 from models.diffusion_scheduler import DDIMScheduler
@@ -100,23 +99,6 @@ class ImprovedTrainer:
             lambda_prior=config.get('lambda_prior', 0.10),
         ).to(self.device)
 
-        # ── Scene context injection: persistent hook (no per-step monkey-patching) ──
-        # Registering a pre-forward hook on time_embed once at init is ~20× faster
-        # than creating a new nn.Module and monkey-patching every step.
-        # The hook adds scene_ctx (set via self._scene_ctx before each forward call)
-        # to the time embedding output, injecting global scene context into AdaGN.
-        self._scene_ctx: Optional[torch.Tensor] = None
-
-        def _time_embed_hook(module, input, output):
-            if self._scene_ctx is not None:
-                return output + self._scene_ctx
-            return output
-
-        self._time_embed_hook_handle = self.model.time_embed.register_forward_hook(
-            _time_embed_hook
-        )
-        print("[ImprovedTrainer] Scene context hook registered on time_embed")
-
         self.ema = EMA(self.model, decay=config.get('ema_decay', 0.9999))
 
         # Separate LR: prior + scene encoder train 5× faster
@@ -141,7 +123,7 @@ class ImprovedTrainer:
         self.use_amp   = (config.get('precision', 'float32') == 'bfloat16') \
                          and (self.device.type == 'cuda')
         self.amp_dtype = torch.bfloat16 if self.use_amp else torch.float32
-        self.scaler    = GradScaler('cuda', enabled=False)  # kept for compat; never used
+        self.scaler    = GradScaler(enabled=False)  # kept for compat; never used with bfloat16
         if self.use_amp:
             print("[ImprovedTrainer] Precision: bfloat16")
         else:
@@ -187,7 +169,7 @@ class ImprovedTrainer:
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        with autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
+        with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
             # FIX 4: Get linear prior prediction for bridge + auxiliary loss
             x_prior = self.prior_net(mwir)
 
@@ -256,16 +238,29 @@ class ImprovedTrainer:
         scene_ctx: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Forward pass with scene context injected into the timestep embedding.
+        Inject scene context by adding it to the timestep embedding
+        before the UNet processes it.
 
-        Uses a persistent forward hook registered at __init__ time rather than
-        creating a new nn.Module and monkey-patching every step. The hook adds
-        self._scene_ctx to the time_embed output. This is ~20× faster in Python
-        overhead and allows torch.compile to trace the model graph correctly.
+        Implementation: temporarily monkey-patch the model's time_embed
+        to add scene_ctx, then restore. This avoids modifying the UNet
+        architecture for backward compatibility.
         """
-        self._scene_ctx = scene_ctx
+        original_time_embed = self.model.time_embed
+
+        class SceneAugmentedTimeEmbed(nn.Module):
+            def __init__(self, base_embed, ctx):
+                super().__init__()
+                self.base = base_embed
+                self.ctx = ctx  # (B, dim)
+
+            def forward(self, t):
+                t_emb = self.base(t)
+                return t_emb + self.ctx
+
+        augmented = SceneAugmentedTimeEmbed(original_time_embed, scene_ctx)
+        self.model.time_embed = augmented
         out = self.model(xt, t, mwir)
-        self._scene_ctx = None   # clear so hook is a no-op outside this call
+        self.model.time_embed = original_time_embed
         return out
 
     # ─── Validation ──────────────────────────────────────────────
@@ -410,37 +405,19 @@ class ImprovedTrainer:
 
     # ─── Generate function for Visualizer ────────────────────────
 
-    @torch.no_grad()
     def _generate_fn(self, mwir: torch.Tensor) -> torch.Tensor:
         """Bridge-DDIM sampling over the fixed visualiser batch."""
-        self.model.eval()
-        self.prior_net.eval()
-        self.scene_encoder.eval()
-
-        x_prior  = self.prior_net(mwir)
+        x_prior = self.prior_net(mwir)
         scene_ctx = self.scene_encoder(mwir)
-        B        = mwir.shape[0]
-        lwir_ch  = self.cfg.get('lwir_channels', 1)
-        H, W     = mwir.shape[2], mwir.shape[3]
-
-        # ddim_sample_bridge expects 'model' as its first positional parameter,
-        # not 'model_fn'. Pass a callable that injects scene context.
-        def model_with_ctx(xt, t, m):
-            return self._forward_with_scene_ctx(xt, t, m, scene_ctx)
-
-        result = self.bridge_scheduler.ddim_sample_bridge(
-            model=model_with_ctx,
+        B, C, H, W = mwir.shape
+        return self.bridge_scheduler.ddim_sample_bridge(
+            model_fn=lambda xt, t, m: self._forward_with_scene_ctx(xt, t, m, scene_ctx),
             mwir=mwir,
             x_prior=x_prior,
-            shape=(B, lwir_ch, H, W),          # use lwir_channels, not mwir channels
+            shape=(B, C, H, W),
             num_inference_steps=self.cfg.get('val_ddim_steps', 20),
             device=str(self.device),
         )
-
-        self.model.train()
-        self.prior_net.train()
-        self.scene_encoder.train()
-        return result
 
     def _save(self, tag: str):
         ckpt_dir = self.output_dir / 'checkpoints'

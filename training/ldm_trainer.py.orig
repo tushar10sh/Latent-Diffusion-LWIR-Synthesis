@@ -30,10 +30,13 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.cuda.amp import GradScaler, autocast
 from pathlib import Path
 from typing import Optional
+import numpy as np
 
 from models.ldm.vae import IRVAE
 from models.ldm.dit import ConditionalDiT, DiT_B_4
 from models.diffusion_scheduler import DDIMScheduler, CharacteristicFunctionConsistencyLoss, SpectralConsistencyLoss
+from models.flow_matching import FlowMatchingScheduler
+from models.planck_loss import PlanckRatioLoss
 from training.trainer import EMA, psnr, ssim
 from data.dataset import build_dataloaders, MWIRLWIRDataset
 from training.visualizer import Visualizer
@@ -115,7 +118,11 @@ class VAETrainer:
             ],
             milestones=[1000],
         )
-        self.scaler = GradScaler(enabled=True)
+        _precision     = config.get('precision', 'float32')
+        self.use_amp   = (_precision == 'bfloat16') and (self.device.type == 'cuda')
+        self.amp_dtype = torch.bfloat16 if self.use_amp else torch.float32
+        self.scaler    = GradScaler(enabled=False)   # never needed; VAE trains in float32
+        print(f"[VAETrainer] Precision: {_precision}")
 
         self.train_loader, self.val_loader = build_dataloaders(
             root=config['data_root'],
@@ -151,14 +158,19 @@ class VAETrainer:
                 kl_w = kl_annealing_weight(self.step, kl_warmup, kl_max)
 
                 self.optimizer.zero_grad(set_to_none=True)
-                with autocast(dtype=torch.bfloat16):
+                with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
                     loss, loss_dict = self.vae.training_step(lwir, kl_weight=kl_w)
 
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
+                if not torch.isfinite(loss):
+                    print(f"[VAE] NaN/Inf loss at step {self.step} — skipping.")
+                    self.step += 1
+                    continue
+
+                # bfloat16 does not need GradScaler (same exponent range as float32).
+                # Using GradScaler with bfloat16 causes it to skip every step.
+                loss.backward()
                 nn.utils.clip_grad_norm_(self.vae.parameters(), 1.0)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                self.optimizer.step()
                 self.lr_sched.step()
 
                 for k, v in loss_dict.items():
@@ -214,7 +226,7 @@ class VAETrainer:
             'scale_factor': self.vae.scale_factor,
             'latent_mean':  self.vae.latent_mean,
             'config':       self.cfg,
-        }, self.output_dir / 'vae_final_19MAR2026.pt')
+        }, self.output_dir / 'vae_final.pt')
 
 
 # ─────────────────────────────────────────────
@@ -245,7 +257,7 @@ class DiTTrainer:
         self.vae = vae.to(self.device).eval()
         for p in self.vae.parameters():
             p.requires_grad_(False)
-        if abs(self.vae.scale_factor - 1.0) < 1e-6:
+        if np.any(np.abs(np.array(self.vae.scale_factor) - 1.0) < 1e-6):
             import warnings
             warnings.warn(
                 "[DiTTrainer] vae.scale_factor is still 1.0 (default). "
@@ -257,13 +269,13 @@ class DiTTrainer:
             )
         print(
             f"[DiT Trainer] VAE frozen. "
-            f"scale_factor={self.vae.scale_factor:.5f}  "
-            f"latent_mean={self.vae.latent_mean:.5f}"
+            f"scale_factor={self.vae.scale_factor}  "
+            f"latent_mean={self.vae.latent_mean}"
         )
 
         # DiT
         dit_size = config.get('dit_size', 'B')  # 'S', 'B', 'L'
-        dit_builders = {'S': DiT_B_4, 'B': DiT_B_4, 'L': DiT_B_4}  # import all from dit.py
+        # dit_builders = {'S': DiT_B_4, 'B': DiT_B_4, 'L': DiT_B_4}  # import all from dit.py
         from models.ldm.dit import DiT_S_4, DiT_B_4, DiT_L_4
         builder = {'S': DiT_S_4, 'B': DiT_B_4, 'L': DiT_L_4}[dit_size]
 
@@ -279,49 +291,85 @@ class DiTTrainer:
         n = sum(p.numel() for p in self.dit.parameters())
         print(f"[DiT] Parameters: {n/1e6:.1f}M")
 
-        # Null MWIR token for classifier-free guidance
-        self.cfg_prob = config.get('cfg_prob', 0.1)
-        null_mwir = torch.zeros(1, config.get('mwir_channels', 1),
-                                config.get('image_size', 256),
-                                config.get('image_size', 256))
-        self.register_buffer_null = null_mwir
+        # ── Classifier-Free Guidance null conditioning ────────────
+        # The null conditioning for CFG must be a LEARNED parameter,
+        # NOT the spatial mean of the batch MWIR.
+        #
+        # Why spatial mean is wrong:
+        #   mwir.mean(dim=(-2,-1), keepdim=True).expand_as(mwir) produces a
+        #   perfectly FLAT (spatially uniform) image. This is a specific scene
+        #   type (complete thermal uniformity), not a neutral prior. The DiT
+        #   learns that 'flat MWIR → flat LWIR latent' is valid (10% of steps
+        #   use this), then applies this pattern to real structured MWIR at
+        #   inference via CFG → spatially uniform z → VAE tile artefact.
+        #
+        # Correct approach (used by SD, DALL-E, all production CFG models):
+        #   A trainable nn.Parameter of the same shape as a single MWIR sample.
+        #   Initialised to zero (neutral start). The model learns what 'unconditioned'
+        #   means during training — it converges to something that, when subtracted
+        #   from the conditional prediction, gives maximum guidance signal.
+        self.cfg_prob    = config.get('cfg_prob', 0.1)
+        mwir_c           = config.get('mwir_channels', 1)
+        img_sz           = config.get('image_size', 256)
+        self.null_mwir   = nn.Parameter(
+            torch.zeros(1, mwir_c, img_sz, img_sz)
+        )
+        # Register with the optimizer via a separate param group so its LR
+        # can be tuned independently if needed (uses same LR by default).
+        print(f"[DiT] Learned null MWIR embedding: shape (1,{mwir_c},{img_sz},{img_sz})")
 
-        # Diffusion scheduler
-        self.scheduler = DDIMScheduler(
-            num_train_timesteps=config.get('num_train_timesteps', 1000),
-            schedule=config.get('noise_schedule', 'cosine'),
-            clip_sample=False,
-            prediction_type='epsilon',
-        ).to(self.device)
-
-        # ── Min-SNR loss weighting ──────────────────────────────────────
-        # With a cosine schedule, extreme timesteps (t≈T) have very high
-        # noise and contribute large gradient magnitudes but carry almost
-        # no learning signal — the model learns to predict zero everywhere.
-        # Min-SNR (Hang et al. 2023) clips the per-timestep loss weight to
-        # max(SNR, gamma) / SNR, damping high-noise timesteps.
-        # gamma=5 is the standard recommendation.
-        self.snr_gamma = config.get('snr_gamma', 5.0)
-        # Pre-compute SNR for all timesteps: SNR(t) = ᾱ_t / (1 - ᾱ_t)
-        with torch.no_grad():
-            snr = (
-                self.scheduler.alphas_cumprod
-                / (1.0 - self.scheduler.alphas_cumprod)
+        # ── Scheduler: Flow Matching (default) or DDPM ────────────
+        use_fm = config.get('use_flow_matching', True)
+        if use_fm:
+            self.scheduler = FlowMatchingScheduler(
+                t_scale        = config.get('num_train_timesteps', 1000),
+                time_sampling  = config.get('fm_time_sampling', 'logit_normal'),
+                logit_loc      = config.get('fm_logit_loc', 0.0),
+                logit_scale    = config.get('fm_logit_scale', 1.0),
+                loss_weighting = config.get('fm_loss_weighting', 'constant'),
             ).to(self.device)
-        self._snr = snr   # (T,) — indexed by timestep
+            self._use_flow_matching = True
+            print(f"[DiT] Flow Matching scheduler  "
+                  f"(sampling={config.get('fm_time_sampling','logit_normal')})")
+        else:
+            self.scheduler = DDIMScheduler(
+                num_train_timesteps = config.get('num_train_timesteps', 1000),
+                schedule            = config.get('noise_schedule', 'cosine'),
+                clip_sample         = False,
+                prediction_type     = 'epsilon',
+            ).to(self.device)
+            self._use_flow_matching = False
+            self.snr_gamma = config.get('snr_gamma', 5.0)
+            with torch.no_grad():
+                snr = (self.scheduler.alphas_cumprod
+                       / (1.0 - self.scheduler.alphas_cumprod)).to(self.device)
+            self._snr = snr
+            print("[DiT] DDPM/DDIM scheduler")
 
-        # Losses
-        self.cfc_loss = CharacteristicFunctionConsistencyLoss(num_freqs=32, patch_size=8).to(self.device)
+        # ── Auxiliary losses (latent-space) ───────────────────────
+        self.cfc_loss      = CharacteristicFunctionConsistencyLoss(
+                                 num_freqs=32, patch_size=8).to(self.device)
         self.spectral_loss = SpectralConsistencyLoss().to(self.device)
-        self.lambda_cfc = config.get('lambda_cfc', 0.1)
+        self.lambda_cfc      = config.get('lambda_cfc', 0.1)
         self.lambda_spectral = config.get('lambda_spectral', 0.05)
+
+        # ── Planck ratio loss (pixel-space, applied on decoded output) ──
+        self.lambda_planck = config.get('planck', {}).get('lambda_planck', 0.0)
+        use_plank_loss = config.get('use_plank_loss', True)
+        if use_plank_loss and self.lambda_planck > 0 and 'planck' in config:
+            self.planck_loss = PlanckRatioLoss.from_config(config).to(self.device)
+            print(f"[DiT] Planck ratio loss  "
+                  f"λ={self.lambda_planck}  "
+                  f"Δ={config['planck'].get('allowed_delta_K',15)}K")
+        else:
+            self.planck_loss = None
 
         # EMA
         self.ema = EMA(self.dit, decay=config.get('ema_decay', 0.9999))
 
-        # Optimizer
+        # Optimizer — includes null_mwir learned embedding
         self.optimizer = AdamW(
-            self.dit.parameters(),
+            list(self.dit.parameters()) + [self.null_mwir],
             lr=config.get('dit_lr', 1e-4),
             betas=(0.9, 0.999),
             weight_decay=config.get('weight_decay', 1e-4),
@@ -337,7 +385,11 @@ class DiTTrainer:
             milestones=[warmup],
         )
 
-        self.scaler = GradScaler(enabled=True)
+        _precision      = config.get('precision', 'float32')
+        self.use_amp    = (_precision == 'bfloat16') and (self.device.type == 'cuda')
+        self.amp_dtype  = torch.bfloat16 if self.use_amp else torch.float32
+        self.scaler     = GradScaler(enabled=False)   # never needed; removed for correctness
+        print(f"[DiTTrainer] Precision: {_precision}")
         self.train_loader, self.val_loader = build_dataloaders(
             root=config['data_root'],
             image_size=config.get('image_size', 256),
@@ -381,77 +433,84 @@ class DiTTrainer:
     def train_step(self, batch):
         mwir = batch['mwir'].to(self.device)
         lwir = batch['lwir'].to(self.device)
-        B = mwir.shape[0]
+        B    = mwir.shape[0]
 
-        # Encode LWIR to latent (frozen VAE, no grad)
+        # Encode LWIR to DiT-space latent (frozen VAE)
         with torch.no_grad():
             z0 = self._encode(lwir)
 
-        # Classifier-free guidance: randomly drop MWIR conditioning.
-        # NULL conditioning = per-channel spatial mean of the MWIR batch.
-        # Using zeros (all-cold scene) biases the uncond prediction and
-        # causes the model to predict zero noise for "cold" inputs → collapse.
-        # Using the batch mean is a neutral prior that carries no scene info.
+        # CFG: replace conditioning with learned null embedding for cfg_prob fraction
         cfg_mask = (torch.rand(B, device=self.device) < self.cfg_prob)
         if cfg_mask.any():
-            # mean over H, W only; keep (B, C, 1, 1) shape for broadcast
-            mwir_mean = mwir.mean(dim=(-2, -1), keepdim=True).expand_as(mwir)
+            null_expanded = self.null_mwir.expand(B, -1, -1, -1).to(device=self.device)
             mwir_cond = torch.where(
                 cfg_mask.view(B, 1, 1, 1).expand_as(mwir),
-                mwir_mean,
-                mwir,
+                null_expanded, mwir,
             )
         else:
             mwir_cond = mwir
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        with autocast(dtype=torch.bfloat16):
-            # Sample timestep and add noise
-            t = torch.randint(0, self.scheduler.num_train_timesteps, (B,), device=self.device)
-            noise = torch.randn_like(z0)
-            zt, _ = self.scheduler.q_sample(z0, t, noise)
+        with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+            if self._use_flow_matching:
+                # ── Flow Matching ─────────────────────────────────────
+                fm_loss, fm_dict, z0_pred = \
+                    self.scheduler.training_loss_weighted(self.dit, z0, mwir_cond)
+                primary_loss = fm_loss
+                loss_dict = {'fm_mse': fm_dict['fm_mse'],
+                             't_mean': fm_dict['t_mean']}
+            else:
+                # ── DDPM with Min-SNR ─────────────────────────────────
+                t_int = torch.randint(
+                    0, self.scheduler.num_train_timesteps, (B,), device=self.device)
+                noise = torch.randn_like(z0)
+                zt, _ = self.scheduler.q_sample(z0, t_int, noise)
+                noise_pred = self.dit(zt, t_int, mwir_cond)
+                mse_ps = F.mse_loss(noise_pred, noise, reduction='none')
+                mse_ps = mse_ps.mean(dim=(1, 2, 3))
+                snr_t  = self._snr[t_int].float()
+                weights = (torch.clamp(snr_t, max=self.snr_gamma) / snr_t).detach()
+                primary_loss = (weights * mse_ps).mean()
+                sqrt_a   = self.scheduler._extract(
+                    self.scheduler.sqrt_alphas_cumprod, t_int, z0.shape)
+                sqrt_1ma = self.scheduler._extract(
+                    self.scheduler.sqrt_one_minus_alphas_cumprod, t_int, z0.shape)
+                z0_pred  = ((zt - sqrt_1ma * noise_pred) / (sqrt_a + 1e-8)).clamp(-1, 1)
+                loss_dict = {'ddpm_mse': primary_loss.item()}
 
-            # DiT predicts noise
-            noise_pred = self.dit(zt, t, mwir_cond)
-
-            # Per-sample MSE (unreduced — we apply min-SNR weights next)
-            mse_per_sample = F.mse_loss(noise_pred, noise, reduction='none')
-            mse_per_sample = mse_per_sample.mean(dim=(1, 2, 3))   # (B,)
-
-            # Min-SNR loss weighting (Hang et al. 2023).
-            # weight(t) = min(SNR(t), γ) / SNR(t)
-            # Clamps high-noise timesteps that would otherwise dominate and
-            # push the model toward predicting zero noise everywhere.
-            snr_t   = self._snr[t].float()                        # (B,)
-            weights = (torch.clamp(snr_t, max=self.snr_gamma) / snr_t).detach()
-            mse     = (weights * mse_per_sample).mean()
-
-            # Predict z0 for data-space auxiliary losses
-            sqrt_a   = self.scheduler._extract(self.scheduler.sqrt_alphas_cumprod, t, z0.shape)
-            sqrt_1ma = self.scheduler._extract(self.scheduler.sqrt_one_minus_alphas_cumprod, t, z0.shape)
-            z0_pred  = (zt - sqrt_1ma * noise_pred) / (sqrt_a + 1e-8)
-
-            # CFC + spectral on latent z0 estimates
+            # ── Latent-space auxiliary losses ─────────────────────────
             cfc  = self.cfc_loss(z0_pred, z0)
             spec = self.spectral_loss(z0_pred, z0)
+            total = primary_loss + self.lambda_cfc * cfc + self.lambda_spectral * spec
+            loss_dict.update({'cfc': cfc.item(), 'spectral': spec.item()})
 
-            total = mse + self.lambda_cfc * cfc + self.lambda_spectral * spec
+            # ── Planck ratio loss (pixel space) ───────────────────────
+            if self.planck_loss is not None and self.lambda_planck > 0:
+                # Decode z0_pred to pixel space (frozen VAE decoder)
+                with torch.no_grad():
+                    pred_lwir_px = self.vae.decode(z0_pred.float())
+                planck_out = self.planck_loss(pred_lwir_px, mwir)
+                planck_l   = planck_out['planck_loss']
+                total      = total + self.lambda_planck * planck_l
+                loss_dict['planck'] = planck_l.item()
 
-        self.scaler.scale(total).backward()
-        self.scaler.unscale_(self.optimizer)
+            loss_dict['total'] = total.item()
+
+        # Guard against NaN/Inf (bad data or numerical instability)
+        if not torch.isfinite(total):
+            print(f"[DiT] NaN/Inf loss at step {self.global_step} — skipping update.")
+            return {k: float('nan') for k in loss_dict}
+
+        # bfloat16 does NOT need GradScaler — using GradScaler with bfloat16
+        # causes it to skip every optimizer step (detects false inf/nan at
+        # default scale 65536x), so the DiT never trains.
+        total.backward()
         nn.utils.clip_grad_norm_(self.dit.parameters(), 1.0)
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+        self.optimizer.step()
         self.lr_sched.step()
         self.ema.update()
-
-        return {
-            'total': total.item(),
-            'mse': mse.item(),
-            'cfc': cfc.item(),
-            'spectral': spec.item(),
-        }
+        return loss_dict
 
     def train(self):
         cfg = self.cfg
@@ -485,8 +544,9 @@ class DiTTrainer:
                     print(
                         f"Step {self.global_step+1:>7d} | "
                         f"Total: {avg.get('total',0):.4f} | "
-                        f"MSE: {avg.get('mse',0):.4f} | "
+                        f"FM: {avg.get('fm_mse', avg.get('ddpm_mse',0)):.4f} | "
                         f"CFC: {avg.get('cfc',0):.4f} | "
+                        f"Planck: {avg.get('planck',0):.4f} | "
                         f"LR: {lr:.2e} | "
                         f"{log_every/elapsed:.1f} it/s"
                     )
@@ -530,8 +590,8 @@ class DiTTrainer:
     @torch.no_grad()
     def _generate_fn(self, mwir: torch.Tensor) -> torch.Tensor:
         """
-        Full DDIM + CFG sampling over a fixed MWIR batch.
-        Decodes the resulting latent via the frozen VAE decoder.
+        Sample LWIR latents via Flow Matching (Heun ODE) or DDIM,
+        then decode through the frozen VAE decoder.
         mwir: (B, C, H, W) on self.device
         Returns: (B, 1, H, W) pixel-space LWIR, clamped [-1,1], on CPU.
         """
@@ -540,30 +600,38 @@ class DiTTrainer:
         z_channels = self.cfg.get('z_channels', 4)
         H_lat, W_lat = H // vae_f, W // vae_f
 
-        z = torch.randn(B, z_channels, H_lat, W_lat, device=self.device)
-        # Null conditioning = spatial mean of this specific MWIR scene
-        # (consistent with training; zeros would bias toward cold scenes)
-        null_mwir = mwir.mean(dim=(-2, -1), keepdim=True).expand_as(mwir)
-
-        timesteps = torch.linspace(
-            self.scheduler.num_train_timesteps - 1, 0,
-            self._vis_ddim_steps, dtype=torch.long, device=self.device,
-        )
-
-        for i, t_cur in enumerate(timesteps):
-            t_b = t_cur.expand(B)
-            cond_eps   = self.dit(z, t_b, mwir)
-            uncond_eps = self.dit(z, t_b, null_mwir)
-            eps = uncond_eps + self._guidance_scale * (cond_eps - uncond_eps)
-            z = self.scheduler._ddim_step(z, t_cur, eps, timesteps, i, eta=0.0)
+        if self._use_flow_matching:
+            z = self.scheduler.sample_heun(
+                model          = self.dit,
+                mwir           = mwir,
+                shape          = (B, z_channels, H_lat, W_lat),
+                num_steps      = self._vis_ddim_steps,
+                guidance_scale = self._guidance_scale,
+                device         = str(self.device),
+                verbose        = False,
+                null_cond      = self.null_mwir,
+            )
+        else:
+            z = torch.randn(B, z_channels, H_lat, W_lat, device=self.device)
+            null_mwir = self.null_mwir.expand(B, -1, -1, -1)
+            timesteps = torch.linspace(
+                self.scheduler.num_train_timesteps - 1, 0,
+                self._vis_ddim_steps, dtype=torch.long, device=self.device,
+            )
+            for i, t_cur in enumerate(timesteps):
+                t_b        = t_cur.expand(B)
+                cond_eps   = self.dit(z, t_b, mwir)
+                uncond_eps = self.dit(z, t_b, null_mwir)
+                eps = uncond_eps + self._guidance_scale * (cond_eps - uncond_eps)
+                z = self.scheduler._ddim_step(z, t_cur, eps, timesteps, i, eta=0.0)
 
         return self.vae.decode(z).clamp(-1, 1).cpu()
 
     @torch.no_grad()
     def _validate(self, num_steps: int = 20, guidance_scale: float = 3.0):
-        """Full DDIM sampling + PSNR/SSIM on a few validation batches."""
+        """Full sampling + PSNR/SSIM + Planck BT diagnostics on validation batches."""
         self.dit.eval()
-        psnr_vals, ssim_vals = [], []
+        psnr_vals, ssim_vals, planck_errs = [], [], []
 
         for i, batch in enumerate(self.val_loader):
             if i >= 4:
@@ -571,45 +639,35 @@ class DiTTrainer:
             mwir = batch['mwir'][:4].to(self.device)
             lwir = batch['lwir'][:4].to(self.device)
 
-            z0_real = self._encode(lwir)
-            B, C, H, W = z0_real.shape
-            z = torch.randn_like(z0_real)
+            gen_lwir = self._generate_fn(mwir).to(self.device)
 
-            timesteps = torch.linspace(
-                self.scheduler.num_train_timesteps - 1, 0,
-                num_steps, dtype=torch.long, device=self.device
-            )
-            for step_i, t_cur in enumerate(timesteps):
-                t_b = t_cur.expand(B)
-                # Null conditioning = spatial mean (consistent with training)
-                null_mwir = mwir.mean(dim=(-2, -1), keepdim=True).expand_as(mwir)
-                cond_out   = self.dit(z, t_b, mwir)
-                uncond_out = self.dit(z, t_b, null_mwir)
-                eps = uncond_out + guidance_scale * (cond_out - uncond_out)
-                z = self.scheduler._ddim_step(z, t_cur, eps, timesteps, step_i, eta=0.0)
-
-            gen_lwir = self.vae.decode(z)
             for j in range(gen_lwir.shape[0]):
                 psnr_vals.append(psnr(gen_lwir[j:j+1], lwir[j:j+1]))
                 ssim_vals.append(ssim(gen_lwir[j:j+1], lwir[j:j+1]))
 
+            if self.planck_loss is not None:
+                d = self.planck_loss.diagnostics(gen_lwir, mwir, lwir)
+                planck_errs.append(d.get('bt_mae_pred_K', 0.0))
+
         self.dit.train()
         import numpy as np
-        print(
-            f"\n  [Val] PSNR: {np.mean(psnr_vals):.2f} dB | "
-            f"SSIM: {np.mean(ssim_vals):.4f} "
-            f"(cfg={guidance_scale})\n"
-        )
+        mode = "FM-Heun" if self._use_flow_matching else f"DDIM(cfg={guidance_scale})"
+        msg  = (f"\n  [Val/{mode}] PSNR: {np.mean(psnr_vals):.2f} dB | "
+                f"SSIM: {np.mean(ssim_vals):.4f}")
+        if planck_errs:
+            msg += f" | BT-MAE: {np.mean(planck_errs):.2f}K"
+        print(msg + "\n")
 
     def _save(self, tag: str):
         ckpt_dir = self.output_dir / 'checkpoints'
         ckpt_dir.mkdir(exist_ok=True)
         torch.save({
-            'step': self.global_step,
-            'dit': self.dit.state_dict(),
-            'ema': self.ema.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'config': self.cfg,
+            'step':       self.global_step,
+            'dit':        self.dit.state_dict(),
+            'ema':        self.ema.state_dict(),
+            'optimizer':  self.optimizer.state_dict(),
+            'null_mwir':  self.null_mwir.data,    # learned null embedding
+            'config':     self.cfg,
         }, ckpt_dir / f'dit_{tag}.pt')
         print(f"  [Checkpoint] → checkpoints/dit_{tag}.pt")
         # Prune old periodic checkpoints; keep best and final untouched

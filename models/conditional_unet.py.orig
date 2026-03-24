@@ -23,45 +23,12 @@ from einops import rearrange
 def exists(x):
     return x is not None
 
-def zero_module(module: nn.Module) -> nn.Module:
-    """
-    Zero-initialise all parameters of a module.
-
-    IMPORTANT: only call this on modules that are NOT wrapped with
-    spectral_norm. spectral_norm normalises the weight by its spectral
-    norm σ = ||W||_2. If W = 0 then σ = 0 and W/σ = 0/0 = NaN on the
-    first forward pass, regardless of precision.
-
-    For residual output convolutions use zero_conv() instead.
-    """
+def zero_module(module):
     for p in module.parameters():
         nn.init.zeros_(p)
     return module
 
-
-def zero_conv(in_c: int, out_c: int, kernel: int = 1, padding: int = 0) -> nn.Conv2d:
-    """
-    Plain Conv2d (no spectral_norm) with zero weight initialisation.
-
-    Used for residual output projections where the intent is 'identity at
-    init'. Spectral_norm must NOT be applied here: spectral_norm divides
-    the weight by its spectral norm, and zero / zero = NaN.
-
-    A plain Conv2d with zero weight is safe: it outputs 0 initially,
-    making the residual branch a no-op, which is the intended behaviour.
-    """
-    conv = nn.Conv2d(in_c, out_c, kernel, padding=padding, bias=True)
-    nn.init.zeros_(conv.weight)
-    nn.init.zeros_(conv.bias)
-    return conv
-
-
 def spectral_conv(in_c, out_c, kernel=3, stride=1, padding=1, bias=True):
-    """
-    Conv2d wrapped with spectral normalisation.
-
-    Do NOT pass the result to zero_module — see zero_conv() above.
-    """
     return nn.utils.spectral_norm(
         nn.Conv2d(in_c, out_c, kernel, stride=stride, padding=padding, bias=bias)
     )
@@ -101,16 +68,10 @@ class AdaGN(nn.Module):
     """
     Adaptive Group Normalization conditioned on both timestep embedding
     and MWIR context vector.
-
-    GroupNorm eps is set to 1e-3 (vs PyTorch default 1e-5) to prevent
-    inf in bfloat16. With only 7 mantissa bits, activations in a
-    homogeneous IR region (water, uniform field) round to the same value,
-    making var ≈ 0. Then var + 1e-5 underflows to 0 in bfloat16, giving
-    1/sqrt(0) = inf. eps=1e-3 stays representable and avoids this.
     """
     def __init__(self, num_channels: int, context_dim: int, groups: int = 32):
         super().__init__()
-        self.gn = nn.GroupNorm(groups, num_channels, affine=False, eps=1e-3)
+        self.gn = nn.GroupNorm(groups, num_channels, affine=False)
         self.scale_proj = nn.Linear(context_dim, num_channels)
         self.shift_proj = nn.Linear(context_dim, num_channels)
         nn.init.zeros_(self.scale_proj.weight); nn.init.ones_(self.scale_proj.bias)
@@ -186,9 +147,7 @@ class ResBlock(nn.Module):
         self.norm1 = AdaGN(in_channels, context_dim, groups)
         self.conv1 = spectral_conv(in_channels, out_channels)
         self.norm2 = AdaGN(out_channels, context_dim, groups)
-        # zero_conv (plain Conv2d, no spectral_norm) for the residual output.
-        # spectral_norm + zero weight = 0/0 = NaN on first forward.
-        self.conv2 = zero_conv(out_channels, out_channels)
+        self.conv2 = zero_module(spectral_conv(out_channels, out_channels))
         self.dropout = nn.Dropout(dropout)
         self.skip = (
             spectral_conv(in_channels, out_channels, kernel=1, padding=0)
@@ -207,42 +166,17 @@ class ResBlock(nn.Module):
 # ─────────────────────────────────────────────
 
 class SelfAttentionBlock(nn.Module):
-    """
-    Self-attention using F.scaled_dot_product_attention (FlashAttention-compatible).
-
-    nn.MultiheadAttention is NOT used here because it can produce NaN in
-    bfloat16 when sequence lengths are large (the 32×32 bottleneck has
-    1024-token sequences with 1024 channels). F.scaled_dot_product_attention
-    uses a numerically stable FlashAttention kernel on modern GPUs and is
-    safe in bfloat16.
-    """
     def __init__(self, channels: int, heads: int = 8):
         super().__init__()
-        assert channels % heads == 0, f"channels {channels} must be divisible by heads {heads}"
-        self.heads    = heads
-        self.head_dim = channels // heads
-        self.norm     = nn.GroupNorm(32, channels, eps=1e-3)   # 1e-3 prevents bfloat16 underflow
-        self.to_qkv   = nn.Linear(channels, 3 * channels, bias=False)
+        self.norm = nn.GroupNorm(32, channels)
+        self.attn = nn.MultiheadAttention(channels, heads, batch_first=True)
         self.proj_out = zero_module(nn.Conv2d(channels, channels, 1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
         h = self.norm(x)
-        h = rearrange(h, 'b c h w -> b (h w) c')          # (B, N, C)
-
-        qkv = self.to_qkv(h)                               # (B, N, 3C)
-        q, k, v = qkv.chunk(3, dim=-1)
-
-        # Reshape to multi-head format
-        q = rearrange(q, 'b n (nh d) -> b nh n d', nh=self.heads)
-        k = rearrange(k, 'b n (nh d) -> b nh n d', nh=self.heads)
-        v = rearrange(v, 'b n (nh d) -> b nh n d', nh=self.heads)
-
-        # Numerically stable scaled dot-product attention
-        # (uses FlashAttention when available; safe in bfloat16)
-        h = F.scaled_dot_product_attention(q, k, v)        # (B, nh, N, d)
-        h = rearrange(h, 'b nh n d -> b n (nh d)')         # (B, N, C)
-
+        h = rearrange(h, 'b c h w -> b (h w) c')
+        h, _ = self.attn(h, h, h)
         h = rearrange(h, 'b (h w) c -> b c h w', h=H, w=W)
         return x + self.proj_out(h)
 
@@ -441,8 +375,8 @@ class ConditionalUNet(nn.Module):
         )
 
         # Output
-        self.out_norm = nn.GroupNorm(32, base_channels, eps=1e-3)
-        self.out_conv = zero_conv(base_channels, in_channels)
+        self.out_norm = nn.GroupNorm(32, base_channels)
+        self.out_conv = zero_module(spectral_conv(base_channels, in_channels))
 
     def forward(
         self,

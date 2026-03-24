@@ -24,7 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler, autocast
 import numpy as np
 
 from models.conditional_unet import ConditionalUNet
@@ -175,20 +175,9 @@ class Trainer:
             milestones=[warmup_steps],
         )
 
-        # ── Precision ──────────────────────────────────────────────
-        # "float32"  — numerically safe, recommended for this pipeline.
-        #              fft2 (SpectralConsistencyLoss), GroupNorm on homogeneous IR,
-        #              and CFC cos/sin all have bfloat16 instabilities.
-        # "bfloat16" — ~1.5× faster on A100/H100, lower memory.
-        #              Safe only after the float32 upcasts in loss classes.
-        #              Use when throughput matters and precision is verified.
-        precision = config.get('precision', 'float32')
-        self.use_amp  = (precision == 'bfloat16') and (self.device.type == 'cuda')
-        self.amp_dtype = torch.bfloat16 if self.use_amp else torch.float32
-        if self.use_amp:
-            print("[Trainer] Precision: bfloat16 (AMP enabled)")
-        else:
-            print("[Trainer] Precision: float32")
+        # ── Mixed precision ──
+        self.use_amp = config.get('use_amp', True) and self.device.type == 'cuda'
+        self.scaler = GradScaler(enabled=self.use_amp)
 
         # ── Data ──
         self.train_loader, self.val_loader = build_dataloaders(
@@ -231,21 +220,49 @@ class Trainer:
         mwir = batch['mwir'].to(self.device)
         lwir = batch['lwir'].to(self.device)
 
+        # Fast data guard: NaN in input → NaN in loss → NaN gradients.
+        # GradScaler (used for CPU/CPU fallback below) silently skips
+        # optimizer.step() when it detects NaN gradients, permanently
+        # degrading the loss scale and preventing all future updates.
+        if not (torch.isfinite(mwir).all() and torch.isfinite(lwir).all()):
+            n_bad = (~torch.isfinite(mwir)).sum().item() + \
+                    (~torch.isfinite(lwir)).sum().item()
+            print(f"[Trainer] step {self.global_step}: skipping batch — "
+                  f"{n_bad} non-finite pixel(s). Fix source files.")
+            return {'mse': float('nan'), 'cfc': float('nan'),
+                    'spectral': float('nan'), 'total': float('nan')}
+
         self.optimizer.zero_grad(set_to_none=True)
 
-        noise_pred, noise_target, x0_pred, x0_target, t = \
-            self.scheduler.training_losses(self.model, lwir, mwir)
-        total_loss, loss_dict = self.criterion(
-            noise_pred, noise_target, x0_pred, x0_target
-        )
+        with autocast(enabled=self.use_amp, dtype=torch.bfloat16):
+            noise_pred, noise_target, x0_pred, x0_target, t = \
+                self.scheduler.training_losses(self.model, lwir, mwir)
+            total_loss, loss_dict = self.criterion(
+                noise_pred, noise_target, x0_pred, x0_target
+            )
 
+        # Guard: NaN loss means the model received NaN input (bad data file)
+        # or has diverged.  Skip the step rather than propagating NaN weights.
         if not torch.isfinite(total_loss):
-            print(f"[Warning] NaN/Inf loss at step {self.global_step}: {loss_dict}")
+            print(f"[Warning] NaN/Inf loss at step {self.global_step} — "
+                  f"skipping update.  Check data for NaN/Inf values.")
             return {k: float('nan') for k in loss_dict}
 
-        total_loss.backward()
-        nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        self.optimizer.step()
+        # bfloat16 does NOT need gradient scaling — GradScaler is for float16 only.
+        # Using GradScaler with bfloat16 causes it to detect false inf/nan
+        # and skip every optimizer step, so the model never trains.
+        if self.use_amp:
+            # bfloat16 path: plain backward, no scaler
+            total_loss.backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.optimizer.step()
+        else:
+            self.scaler.scale(total_loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
         self.scheduler_lr.step()
         self.ema.update()
 
@@ -269,7 +286,7 @@ class Trainer:
             t = torch.randint(0, self.scheduler.num_train_timesteps, (B,), device=self.device)
             noise = torch.randn_like(lwir)
             xt, _ = self.scheduler.q_sample(lwir, t, noise)
-            with autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
+            with autocast(enabled=self.use_amp, dtype=torch.bfloat16):
                 noise_pred = self.model(xt, t, mwir)
             loss, _ = self.criterion(noise_pred, noise)
             val_loss_total += loss.item() * B

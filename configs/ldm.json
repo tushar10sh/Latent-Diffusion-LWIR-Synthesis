@@ -13,6 +13,9 @@
   "val_frac": 0.1,
   "num_workers": 8,
 
+  "_precision_note": "float32 = numerically safe (recommended); bfloat16 = ~1.5x faster on A100 but has fft2/GroupNorm instabilities",
+  "precision": "float32",
+
   "_stage1_vae": "Fine-tune KL-VAE on LWIR imagery",
   "sd_vae_path": "./pretrained_weights/sd_vae/diffusion_pytorch_model.safetensors",
   "vae_ch": 128,
@@ -22,7 +25,7 @@
   "vae_f": 4,
   "vae_lr": 4.5e-6,
   "vae_batch_size": 16,
-  "vae_total_steps": 40000,
+  "vae_total_steps": 50000,
   "kl_weight_start": 1e-7,
   "kl_weight_max": 1e-4,
   "kl_warmup_steps": 10000,
@@ -56,6 +59,7 @@
   "weight_decay": 1e-4,
 
   "_planck_loss": "Fill in your actual calibration coefficients before enabling",
+  "use_plank_loss": false,
   "planck": {
     "lambda_planck": 0.05,
     "mwir_wavelength_um": 4.0,
@@ -70,7 +74,30 @@
     "lwir_norm_max": 3836.0,
     "allowed_delta_K": 15.0,
     "use_confidence": true,
-    "confidence_sigma": 2.0
+    "confidence_sigma": 2.0,
+
+    "_added_from_data": "Added from data",
+    "lwir_rad_to_bt_k1": 1585.468485,
+    "lwir_rad_to_bt_k2": 188.801657,
+    "_lwir_radiance_to_bt_formula": "(lwir_rad_to_bt_k1/log((lwir_rad_to_bt_k2/lwir_radiance) + 1))",
+    "lwir_saturation_radiance": 1.989696,
+    "lwir_saturation_temp": 347.446740,
+    "lwir_count_to_rad": 0.000207,
+    "_lwir_count_to_rad_formula": "lwir_count * lwir_count_to_rad",
+    "lwir_calibration_gain": 0.788820,
+    "lwir_calibration_offset": 51.879417,
+    "_lwir_calibration_formula": "lwir_calibrated_bt = lwir_bt * lwir_calibration_gain + lwir_calibration_offset",
+
+    "mwir_rad_to_bt_k1": 3327.998516,
+    "mwir_rad_to_bt_k2": 7307.514371,
+    "_mwir_radiance_to_bt_formula": "(mwir_rad_to_bt_k1/log((mwir_rad_to_bt_k2/mwir_radiance) + 1))",
+    "mwir_saturation_radiance": 4.041386,
+    "mwir_saturation_temp": 443.696235,
+    "mwir_count_to_rad": 0.000269,
+    "_mwir_count_to_rad_formula": "mwir_count * mwir_count_to_rad",
+    "mwir_calibration_gain": 0.970713,
+    "mwir_calibration_offset": 14.533715,
+    "_mwir_calibration_formula": "mwir_calibrated_bt = mwir_bt * mwir_calibration_gain + mwir_calibration_offset"
   },
 
   "log_every": 50,

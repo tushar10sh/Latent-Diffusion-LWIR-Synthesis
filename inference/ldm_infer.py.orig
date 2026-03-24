@@ -64,7 +64,6 @@ class LDMInference:
         ).to(self.device)
         self.vae.load_state_dict(vae_state['vae'])
         self.vae.scale_factor = vae_state['scale_factor']
-        self.vae.latent_mean  = vae_state.get('latent_mean', 0.0)   # backward compatible
         self.vae.eval()
         print(f"[LDM] VAE loaded. scale_factor={self.vae.scale_factor:.4f}")
 
@@ -89,19 +88,6 @@ class LDMInference:
             self.dit.load_state_dict(dit_state['dit'])
             print("[LDM] DiT loaded (no EMA).")
         self.dit.eval()
-
-        # Load trained null MWIR embedding (saved alongside DiT weights).
-        # Must NOT be replaced with a spatial mean — see DiTTrainer for rationale.
-        # Falls back to zeros for checkpoints saved before this fix.
-        null_raw = dit_state.get('null_mwir', None)
-        if null_raw is not None:
-            self.null_mwir = null_raw.to(self.device)
-            print("[LDM] Learned null MWIR embedding loaded from checkpoint.")
-        else:
-            mwir_c = dit_cfg.get('mwir_channels', 1)
-            img_sz = dit_cfg.get('image_size', 256)
-            self.null_mwir = torch.zeros(1, mwir_c, img_sz, img_sz, device=self.device)
-            print("[LDM] null_mwir not in checkpoint — using zeros (retrain recommended).")
 
         # Diffusion scheduler
         self.scheduler = DDIMScheduler(
@@ -136,8 +122,7 @@ class LDMInference:
             self.num_steps, dtype=torch.long, device=self.device
         )
 
-        # Use learned null embedding (trained alongside DiT, not spatial mean)
-        null_mwir = self.null_mwir.expand(B, -1, -1, -1)
+        null_mwir = torch.zeros_like(mwir)  # null conditioning for CFG
 
         for i, t_cur in enumerate(timesteps):
             t_b = t_cur.expand(B)
@@ -224,7 +209,7 @@ class LDMInference:
         H_lat, W_lat = H // self.vae_f, W // self.vae_f
 
         z = torch.randn(B, self.z_channels, H_lat, W_lat, device=self.device)
-        null_mwir = self.null_mwir.expand(B, -1, -1, -1)
+        null_mwir = torch.zeros_like(mwir_patch)
 
         timesteps = torch.linspace(
             self.scheduler.num_train_timesteps - 1, 0,

@@ -106,30 +106,10 @@ def percentile_normalize(
     high_pct: float = 98.0,
 ) -> np.ndarray:
     """
-    Percentile-based normalization — robust to outliers in thermal scenes.
+    Percentile-based normalization — robust to outliers in thermal scenes
+    (e.g., hot targets like engines, cold shadows).
     Maps [p_low, p_high] → [-1, 1].
-
-    NaN/Inf handling: invalid pixels are replaced with the channel median
-    before computing percentiles, preventing silent NaN propagation that
-    causes all downstream losses to be NaN and all optimizer steps to be
-    silently skipped by GradScaler.
     """
-    # Replace NaN/Inf with the finite median so percentile is computable
-    finite_mask = np.isfinite(img)
-    if not finite_mask.all():
-        n_bad = (~finite_mask).sum()
-        median_val = float(np.median(img[finite_mask])) if finite_mask.any() else 0.0
-        img = img.copy()
-        img[~finite_mask] = median_val
-        # Warn only once per unique bad count to avoid log spam
-        import warnings
-        warnings.warn(
-            f"[percentile_normalize] {n_bad} NaN/Inf pixel(s) replaced with "
-            f"median ({median_val:.4f}). Check source data for sensor dropouts "
-            f"or invalid no-data values.",
-            RuntimeWarning, stacklevel=2,
-        )
-
     lo = np.percentile(img, low_pct)
     hi = np.percentile(img, high_pct)
     img = np.clip(img, lo, hi)
@@ -257,12 +237,8 @@ class MWIRLWIRDataset(Dataset):
         ext = path.suffix.lower()
         if ext == '.npy':
             arr = np.load(path)
-            # arr[np.isnan(arr)] = 0 # explicitly set nan to zero
-            # arr[np.isinf(arr)] = 0 # explicitly set nan to zero
-            if np.any(np.isnan(arr)):
-                print(f'[MWIRLWIRDataset] path: {path} has NaN')
-            if np.any(np.isinf(arr)):
-                print(f'[MWIRLWIRDataset] path: {path} has Inf')
+            # arr = np.fromfile(path, dtype=np.float32)
+            # arr = np.reshape(arr, (224, 224))
         elif ext == '.npz':
             d = np.load(path)
             arr = d[list(d.keys())[0]]
@@ -285,47 +261,14 @@ class MWIRLWIRDataset(Dataset):
 
         if arr.ndim == 2:
             arr = arr[None]  # ensure (C, H, W)
-        arr = arr.astype(np.float32)
-
-        # Defensive sanitisation: replace NaN/Inf with per-channel median.
-        # GeoTIFF no-data regions and some sensor output files use NaN or large
-        # sentinel values. A single NaN propagates through np.percentile → NaN
-        # normalised array → NaN model input → NaN loss.
-        # NOTE: This is a defensive guard, not the confirmed cause of the NaN
-        # losses observed during diffusion training (see trainer.py comments for
-        # the actual cause: GradScaler + bfloat16 incompatibility). However,
-        # sanitising at load time is correct practice regardless.
-        if not np.isfinite(arr).all():
-            n_bad = (~np.isfinite(arr)).sum()
-            for c in range(arr.shape[0]):
-                ch = arr[c]
-                finite_mask = np.isfinite(ch)
-                if finite_mask.any():
-                    fill = float(np.median(ch[finite_mask]))
-                else:
-                    fill = 0.0
-                ch[~finite_mask] = fill
-            import warnings
-            warnings.warn(
-                f"[Dataset] {path.name}: {n_bad} non-finite values (NaN/Inf) "
-                f"replaced with per-channel median. Check your source data.",
-                stacklevel=2,
-            )
-
-        return arr
+        return arr.astype(np.float32)
 
     def _normalize(self, arr: np.ndarray) -> torch.Tensor:
         # Per-channel percentile normalization
         normed = np.stack([
             percentile_normalize(arr[c]) for c in range(arr.shape[0])
         ], axis=0)
-        t = torch.from_numpy(normed)
-        # Final guard: percentile_normalize is robust but can still produce
-        # NaN if the channel is all-identical values (hi==lo, division by ~1e-8).
-        # Replace any remaining NaN/Inf with 0.0 (neutral in [-1,1] space).
-        if not torch.isfinite(t).all():
-            t = torch.nan_to_num(t, nan=0.0, posinf=1.0, neginf=-1.0)
-        return t
+        return torch.from_numpy(normed)
 
     def _resize(self, t: torch.Tensor) -> torch.Tensor:
         if t.shape[-2] != self.image_size or t.shape[-1] != self.image_size:
@@ -378,7 +321,7 @@ class MWIRLWIRDataset(Dataset):
         return {
             'mwir': mwir.float(),          # (C, H, W), range ≈ [-1, 1]
             'lwir': lwir.float(),          # (C, H, W), range ≈ [-1, 1]
-            'path': str(self.mwir_paths[idx].stem),
+            'path': str(self.lwir_paths[idx].stem),
         }
 
 

@@ -27,7 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from pathlib import Path
 from typing import Optional
 
@@ -117,7 +117,11 @@ class VAETrainer:
             ],
             milestones=[1000],
         )
-        self.scaler = GradScaler(enabled=True)
+        _precision     = config.get('precision', 'float32')
+        self.use_amp   = (_precision == 'bfloat16') and (self.device.type == 'cuda')
+        self.amp_dtype = torch.bfloat16 if self.use_amp else torch.float32
+        self.scaler    = GradScaler('cuda', enabled=False)   # never needed; VAE trains in float32
+        print(f"[VAETrainer] Precision: {_precision}")
 
         self.train_loader, self.val_loader = build_dataloaders(
             root=config['data_root'],
@@ -153,14 +157,19 @@ class VAETrainer:
                 kl_w = kl_annealing_weight(self.step, kl_warmup, kl_max)
 
                 self.optimizer.zero_grad(set_to_none=True)
-                with autocast(dtype=torch.bfloat16):
+                with autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
                     loss, loss_dict = self.vae.training_step(lwir, kl_weight=kl_w)
 
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
+                if not torch.isfinite(loss):
+                    print(f"[VAE] NaN/Inf loss at step {self.step} — skipping.")
+                    self.step += 1
+                    continue
+
+                # bfloat16 does not need GradScaler (same exponent range as float32).
+                # Using GradScaler with bfloat16 causes it to skip every step.
+                loss.backward()
                 nn.utils.clip_grad_norm_(self.vae.parameters(), 1.0)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                self.optimizer.step()
                 self.lr_sched.step()
 
                 for k, v in loss_dict.items():
@@ -281,8 +290,32 @@ class DiTTrainer:
         n = sum(p.numel() for p in self.dit.parameters())
         print(f"[DiT] Parameters: {n/1e6:.1f}M")
 
-        # Null MWIR token for classifier-free guidance
-        self.cfg_prob = config.get('cfg_prob', 0.1)
+        # ── Classifier-Free Guidance null conditioning ────────────
+        # The null conditioning for CFG must be a LEARNED parameter,
+        # NOT the spatial mean of the batch MWIR.
+        #
+        # Why spatial mean is wrong:
+        #   mwir.mean(dim=(-2,-1), keepdim=True).expand_as(mwir) produces a
+        #   perfectly FLAT (spatially uniform) image. This is a specific scene
+        #   type (complete thermal uniformity), not a neutral prior. The DiT
+        #   learns that 'flat MWIR → flat LWIR latent' is valid (10% of steps
+        #   use this), then applies this pattern to real structured MWIR at
+        #   inference via CFG → spatially uniform z → VAE tile artefact.
+        #
+        # Correct approach (used by SD, DALL-E, all production CFG models):
+        #   A trainable nn.Parameter of the same shape as a single MWIR sample.
+        #   Initialised to zero (neutral start). The model learns what 'unconditioned'
+        #   means during training — it converges to something that, when subtracted
+        #   from the conditional prediction, gives maximum guidance signal.
+        self.cfg_prob    = config.get('cfg_prob', 0.1)
+        mwir_c           = config.get('mwir_channels', 1)
+        img_sz           = config.get('image_size', 256)
+        self.null_mwir   = nn.Parameter(
+            torch.zeros(1, mwir_c, img_sz, img_sz)
+        )
+        # Register with the optimizer via a separate param group so its LR
+        # can be tuned independently if needed (uses same LR by default).
+        print(f"[DiT] Learned null MWIR embedding: shape (1,{mwir_c},{img_sz},{img_sz})")
 
         # ── Scheduler: Flow Matching (default) or DDPM ────────────
         use_fm = config.get('use_flow_matching', True)
@@ -332,9 +365,9 @@ class DiTTrainer:
         # EMA
         self.ema = EMA(self.dit, decay=config.get('ema_decay', 0.9999))
 
-        # Optimizer
+        # Optimizer — includes null_mwir learned embedding
         self.optimizer = AdamW(
-            self.dit.parameters(),
+            list(self.dit.parameters()) + [self.null_mwir],
             lr=config.get('dit_lr', 1e-4),
             betas=(0.9, 0.999),
             weight_decay=config.get('weight_decay', 1e-4),
@@ -350,7 +383,11 @@ class DiTTrainer:
             milestones=[warmup],
         )
 
-        self.scaler = GradScaler(enabled=True)
+        _precision      = config.get('precision', 'float32')
+        self.use_amp    = (_precision == 'bfloat16') and (self.device.type == 'cuda')
+        self.amp_dtype  = torch.bfloat16 if self.use_amp else torch.float32
+        self.scaler     = GradScaler('cuda', enabled=False)   # never needed; removed for correctness
+        print(f"[DiTTrainer] Precision: {_precision}")
         self.train_loader, self.val_loader = build_dataloaders(
             root=config['data_root'],
             image_size=config.get('image_size', 256),
@@ -400,20 +437,20 @@ class DiTTrainer:
         with torch.no_grad():
             z0 = self._encode(lwir)
 
-        # Classifier-free guidance: null conditioning = per-scene MWIR mean
+        # CFG: replace conditioning with learned null embedding for cfg_prob fraction
         cfg_mask = (torch.rand(B, device=self.device) < self.cfg_prob)
         if cfg_mask.any():
-            mwir_mean = mwir.mean(dim=(-2, -1), keepdim=True).expand_as(mwir)
+            null_expanded = self.null_mwir.expand(B, -1, -1, -1)
             mwir_cond = torch.where(
                 cfg_mask.view(B, 1, 1, 1).expand_as(mwir),
-                mwir_mean, mwir,
+                null_expanded, mwir,
             )
         else:
             mwir_cond = mwir
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        with autocast(dtype=torch.bfloat16):
+        with autocast('cuda', enabled=self.use_amp, dtype=self.amp_dtype):
             if self._use_flow_matching:
                 # ── Flow Matching ─────────────────────────────────────
                 fm_loss, fm_dict, z0_pred = \
@@ -458,11 +495,17 @@ class DiTTrainer:
 
             loss_dict['total'] = total.item()
 
-        self.scaler.scale(total).backward()
-        self.scaler.unscale_(self.optimizer)
+        # Guard against NaN/Inf (bad data or numerical instability)
+        if not torch.isfinite(total):
+            print(f"[DiT] NaN/Inf loss at step {self.global_step} — skipping update.")
+            return {k: float('nan') for k in loss_dict}
+
+        # bfloat16 does NOT need GradScaler — using GradScaler with bfloat16
+        # causes it to skip every optimizer step (detects false inf/nan at
+        # default scale 65536x), so the DiT never trains.
+        total.backward()
         nn.utils.clip_grad_norm_(self.dit.parameters(), 1.0)
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+        self.optimizer.step()
         self.lr_sched.step()
         self.ema.update()
         return loss_dict
@@ -564,10 +607,11 @@ class DiTTrainer:
                 guidance_scale = self._guidance_scale,
                 device         = str(self.device),
                 verbose        = False,
+                null_cond      = self.null_mwir,
             )
         else:
             z = torch.randn(B, z_channels, H_lat, W_lat, device=self.device)
-            null_mwir = mwir.mean(dim=(-2, -1), keepdim=True).expand_as(mwir)
+            null_mwir = self.null_mwir.expand(B, -1, -1, -1)
             timesteps = torch.linspace(
                 self.scheduler.num_train_timesteps - 1, 0,
                 self._vis_ddim_steps, dtype=torch.long, device=self.device,
@@ -616,11 +660,12 @@ class DiTTrainer:
         ckpt_dir = self.output_dir / 'checkpoints'
         ckpt_dir.mkdir(exist_ok=True)
         torch.save({
-            'step': self.global_step,
-            'dit': self.dit.state_dict(),
-            'ema': self.ema.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'config': self.cfg,
+            'step':       self.global_step,
+            'dit':        self.dit.state_dict(),
+            'ema':        self.ema.state_dict(),
+            'optimizer':  self.optimizer.state_dict(),
+            'null_mwir':  self.null_mwir.data,    # learned null embedding
+            'config':     self.cfg,
         }, ckpt_dir / f'dit_{tag}.pt')
         print(f"  [Checkpoint] → checkpoints/dit_{tag}.pt")
         # Prune old periodic checkpoints; keep best and final untouched

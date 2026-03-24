@@ -1,0 +1,60 @@
+*** /dev/null
+--- /dev/null
+***************
+*** 26
+- def zero_module(module):
+--- 26,36 -----
++ def zero_module(module: nn.Module) -> nn.Module:
++     """
++     Zero-initialise all parameters of a module.
++ 
++     IMPORTANT: only call this on modules that are NOT wrapped with
++     spectral_norm. spectral_norm normalises the weight by its spectral
++     norm σ = ||W||_2. If W = 0 then σ = 0 and W/σ = 0/0 = NaN on the
++     first forward pass, regardless of precision.
++ 
++     For residual output convolutions use zero_conv() instead.
++     """
+***************
+*** 0
+--- 41,58 -----
++ 
++ def zero_conv(in_c: int, out_c: int, kernel: int = 1, padding: int = 0) -> nn.Conv2d:
++     """
++     Plain Conv2d (no spectral_norm) with zero weight initialisation.
++ 
++     Used for residual output projections where the intent is 'identity at
++     init'. Spectral_norm must NOT be applied here: spectral_norm divides
++     the weight by its spectral norm, and zero / zero = NaN.
++ 
++     A plain Conv2d with zero weight is safe: it outputs 0 initially,
++     making the residual branch a no-op, which is the intended behaviour.
++     """
++     conv = nn.Conv2d(in_c, out_c, kernel, padding=padding, bias=True)
++     nn.init.zeros_(conv.weight)
++     nn.init.zeros_(conv.bias)
++     return conv
++ 
++ 
+***************
+*** 0
+--- 60,64 -----
++     """
++     Conv2d wrapped with spectral normalisation.
++ 
++     Do NOT pass the result to zero_module — see zero_conv() above.
++     """
+***************
+*** 156
+-         self.conv2 = zero_module(spectral_conv(out_channels, out_channels))
+--- 189,191 -----
++         # zero_conv (plain Conv2d, no spectral_norm) for the residual output.
++         # spectral_norm + zero weight = 0/0 = NaN on first forward.
++         self.conv2 = zero_conv(out_channels, out_channels)
+***************
+*** 409,410
+-         self.out_norm = nn.GroupNorm(32, base_channels, eps=1e-3)  # 1e-3 for bfloat16
+-         self.out_conv = zero_module(spectral_conv(base_channels, in_channels))
+--- 444,445 -----
++         self.out_norm = nn.GroupNorm(32, base_channels, eps=1e-3)
++         self.out_conv = zero_conv(base_channels, in_channels)

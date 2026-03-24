@@ -257,33 +257,23 @@ class FlowMatchingScheduler(nn.Module):
         guidance_scale: float = 1.0,
         device:         str   = 'cuda',
         verbose:        bool  = False,
-        null_cond:      Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Euler ODE integration from t=1 (noise) to t=0 (data).
 
-        Args:
-            null_cond: the null conditioning for CFG. Must be a learned
-                       nn.Parameter (from DiTTrainer.null_mwir), not a
-                       spatial mean. If None, CFG is disabled (guidance_scale
-                       is ignored). Passing a flat spatial mean produces a
-                       tile artefact — see DiTTrainer for the correct source.
+        dx/dt = -u_θ(x_t, t, cond)
+        x_{t-Δt} = x_t + u_θ · Δt   (Δt > 0 since we go t=1→0, so dt = -1/N)
+
+        Fast and simple. For most use cases 20 steps gives quality
+        equivalent to DDIM 50 steps.
         """
         B    = mwir.shape[0]
         x    = torch.randn(shape, device=device)
         dt   = 1.0 / num_steps
-
-        if guidance_scale > 1.0 and null_cond is None:
-            raise ValueError(
-                "guidance_scale > 1.0 requires null_cond (the learned null MWIR "
-                "embedding from DiTTrainer.null_mwir). "
-                "Passing None disables CFG — set guidance_scale=1.0 or provide null_cond."
-            )
-
-        null = null_cond.expand(B, -1, -1, -1).to(device) if null_cond is not None else None
+        null = mwir.mean(dim=(-2, -1), keepdim=True).expand_as(mwir)
 
         for i in range(num_steps):
-            t_val  = 1.0 - i * dt
+            t_val  = 1.0 - i * dt                       # t goes 1 → dt
             t_cont = torch.full((B,), t_val, device=device)
             t_emb  = self._t_to_embed(t_cont)
 
@@ -294,7 +284,7 @@ class FlowMatchingScheduler(nn.Module):
             else:
                 u = model(x, t_emb, mwir)
 
-            x = x - u * dt
+            x = x - u * dt                              # Euler step toward t=0
 
             if verbose and (i + 1) % 5 == 0:
                 print(f"  FM Euler {i+1}/{num_steps}", end='\r')
@@ -313,26 +303,22 @@ class FlowMatchingScheduler(nn.Module):
         guidance_scale: float = 1.0,
         device:         str   = 'cuda',
         verbose:        bool  = False,
-        null_cond:      Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Heun's method (2nd-order Runge-Kutta) ODE integration.
+        Heun's method (2nd-order Runge-Kutta) for ODE integration.
 
-        Args:
-            null_cond: learned null MWIR embedding (DiTTrainer.null_mwir).
-                       Required when guidance_scale > 1.0. Must NOT be a
-                       spatial mean — see sample_euler docstring for details.
+        Same NFE cost per step as Euler but 2nd-order accurate → better
+        quality for the same number of steps. Recommended for inference.
+
+        Two evaluations per step:
+            u₁ = u_θ(x_t,   t,      cond)   — predictor
+            u₂ = u_θ(x̃_{t-Δt}, t-Δt, cond)  — corrector
+            x_{t-Δt} = x_t - 0.5·(u₁ + u₂)·Δt
         """
-        if guidance_scale > 1.0 and null_cond is None:
-            raise ValueError(
-                "guidance_scale > 1.0 requires null_cond (the learned null MWIR "
-                "embedding). Set guidance_scale=1.0 or provide null_cond."
-            )
-
         B    = mwir.shape[0]
         x    = torch.randn(shape, device=device)
         dt   = 1.0 / num_steps
-        null = null_cond.expand(B, -1, -1, -1).to(device) if null_cond is not None else None
+        null = mwir.mean(dim=(-2, -1), keepdim=True).expand_as(mwir)
 
         def eval_u(x_in, t_val):
             t_cont = torch.full((B,), t_val, device=device)
@@ -363,14 +349,12 @@ class FlowMatchingScheduler(nn.Module):
             print()
         return x.clamp(-1, 1)
 
+    # Alias so DiTTrainer._generate_fn can call the same interface
+    # as the old DDIM sampler
     def sample(self, model, mwir, shape, num_steps=20, guidance_scale=1.0,
-               device='cuda', verbose=False, method='heun',
-               null_cond=None):
-        """Convenience alias. Pass null_cond=trainer.null_mwir for CFG."""
+               device='cuda', verbose=False, method='heun'):
         if method == 'euler':
             return self.sample_euler(model, mwir, shape, num_steps,
-                                     guidance_scale, device, verbose,
-                                     null_cond=null_cond)
+                                     guidance_scale, device, verbose)
         return self.sample_heun(model, mwir, shape, num_steps,
-                                guidance_scale, device, verbose,
-                                null_cond=null_cond)
+                                guidance_scale, device, verbose)

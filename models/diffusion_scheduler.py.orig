@@ -67,7 +67,7 @@ class CharacteristicFunctionConsistencyLoss(nn.Module):
         patch_size:  spatial patch for local distribution matching
     """
 
-    def __init__(self, num_freqs: int = 32, max_freq: float = 1.0, patch_size: int = 16):
+    def __init__(self, num_freqs: int = 32, max_freq: float = 5.0, patch_size: int = 16):
         super().__init__()
         self.patch_size = patch_size
         # Fixed test frequencies ω ∈ [-max_freq, max_freq]
@@ -269,14 +269,8 @@ class DDIMScheduler(nn.Module):
             noise_pred = self._v_to_eps(xt, t, model_out)
             x0_pred = self._predict_x0_from_eps(xt, t, noise_pred)
 
-        # Hard clamp x0_pred regardless of clip_sample config.
-        # At high timesteps (t → T), sqrt(ᾱ_t) → 0 and x0_pred = (x_t - sqrt(1-ᾱ)·ε̂)/sqrt(ᾱ)
-        # diverges to O(100–600) for a unit-norm prediction. Passing these extreme
-        # values to CFC loss (cos/sin of large phases) and spectral loss produces
-        # chaotic gradients that trigger GradScaler inf-detection even in bfloat16.
-        # Clamping here only affects the auxiliary losses — the primary MSE loss
-        # on noise_pred is unaffected and is still trained correctly at high t.
-        x0_pred = x0_pred.clamp(-1.0, 1.0)
+        if self.clip_sample:
+            x0_pred = x0_pred.clamp(-self.clip_range, self.clip_range)
 
         return noise_pred, noise, x0_pred, x0, t
 

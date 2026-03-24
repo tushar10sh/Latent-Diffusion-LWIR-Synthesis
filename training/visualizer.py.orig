@@ -240,17 +240,9 @@ class Visualizer:
                         split_dir / f"{stem}_{tag}.png"
                     )
 
-            # PSNR in [-1,1] space (consistent with training metrics).
-            # Guard: if the model output contains NaN, mse=NaN, and NaN > 1e-10
-            # evaluates to False in Python, which silently returns float("inf").
-            # We detect NaN explicitly and report -1 dB as a clear failure signal.
-            if not np.isfinite(gen_np).all():
-                p = -1.0   # sentinel: NaN output from model (training diverged)
-                print(f"[Visualizer] WARNING: sample {i} generated NaN/Inf. "
-                      f"Check for GradScaler+bfloat16 issue or NaN in source data.")
-            else:
-                mse = float(np.mean((gen_np - real_np) ** 2))
-                p = 20 * math.log10(2.0 / math.sqrt(mse)) if mse > 1e-10 else float("inf")
+            # PSNR in [-1,1] space (consistent with training metrics)
+            mse = float(np.mean((gen_np - real_np) ** 2))
+            p = 20 * math.log10(2.0 / math.sqrt(mse)) if mse > 1e-10 else float("inf")
             psnr_vals.append(p)
             grid_rows.append([mwir_np, gen_np, real_np])
 

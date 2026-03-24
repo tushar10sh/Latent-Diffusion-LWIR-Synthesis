@@ -1,0 +1,85 @@
+{
+  "metrics": {
+    "psnr_mean": 40.86896362788105,
+    "psnr_std": 3.953254016407801,
+    "psnr_min": 33.59973702894611,
+    "psnr_p10": 35.617401977831065,
+    "psnr_median": 41.199233104543616,
+    "ssim_mean": 0.9915899139966151,
+    "ssim_std": 0.003999547137869067,
+    "l1_mean": 0.013944807928055525,
+    "psd_err_mean": 0.0012752428866566762,
+    "kl_per_dim_mean": 6.453163664470347,
+    "kl_per_dim_p5": 6.275582313537598,
+    "kl_per_dim_p95": 6.596003913879395,
+    "z_std_mean": 1.0006204352659338,
+    "z_mean_abs": 0.06397108646000133,
+    "n_samples": 129,
+    "split": "val",
+    "vae_ckpt": "runs/mwir2lwir_ldm/stage1_vae/vae_final_19MAR2026.pt",
+    "scale_factor": [
+      1.1136590242385864,
+      2.144162893295288,
+      5.063199043273926,
+      4.4478302001953125
+    ],
+    "latent_mean": [
+      2.1383421421051025,
+      -0.7581166625022888,
+      1.0122935771942139,
+      -0.8254408240318298
+    ]
+  },
+  "verdict": {
+    "psnr_mean": {
+      "value": 40.869,
+      "unit": "dB",
+      "pass": true,
+      "desc": "Mean reconstruction PSNR",
+      "note": "OK"
+    },
+    "psnr_p10": {
+      "value": 35.6174,
+      "unit": "dB",
+      "pass": true,
+      "desc": "10th-percentile PSNR (worst 10%)",
+      "note": "OK"
+    },
+    "ssim_mean": {
+      "value": 0.9916,
+      "unit": "",
+      "pass": true,
+      "desc": "Mean SSIM",
+      "note": "OK"
+    },
+    "z_std_mean": {
+      "value": 1.0006,
+      "unit": "",
+      "pass": true,
+      "desc": "Mean latent std after calibration (target 1.0)",
+      "note": "OK"
+    },
+    "z_mean_abs": {
+      "value": 0.064,
+      "unit": "",
+      "pass": true,
+      "desc": "Abs latent mean after calibration (target 0.0)",
+      "note": "OK"
+    },
+    "kl_per_dim_mean": {
+      "value": 6.4532,
+      "unit": "nats/dim",
+      "pass": true,
+      "desc": "Mean KL per latent dim (matches training log; 2-10 is ideal)",
+      "note": "OK"
+    },
+    "psd_err_mean": {
+      "value": 0.0013,
+      "unit": "",
+      "pass": true,
+      "desc": "Mean log-PSD error (frequency fidelity)",
+      "note": "OK"
+    },
+    "_overall_pass": true
+  }
+}
