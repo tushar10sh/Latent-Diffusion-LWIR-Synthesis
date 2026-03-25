@@ -212,7 +212,11 @@ class FlowMatchingScheduler(nn.Module):
         # → x₀ = x_t - t·u  (solve for x₀)
         t_b = t_cont.view(-1, 1, 1, 1)
         x0_pred = x_t - t_b * u_pred
-        x0_pred = x0_pred.clamp(-1, 1)
+        # NOTE: do NOT clamp to [-1,1] here. In pixel space the caller can
+        # clamp if needed, but in latent space (DiT) the data is N(0,1) and
+        # extends well beyond [-1,1]. Clamping latents destroys ~32% of values
+        # and makes any auxiliary loss on x0_pred compare clamped predictions
+        # against unclamped targets — a silent but severe training bug.
 
         return u_pred, u_target, x0_pred, x0, t_embed
 
