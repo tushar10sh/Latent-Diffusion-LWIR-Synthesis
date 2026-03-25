@@ -67,9 +67,11 @@ class CharacteristicFunctionConsistencyLoss(nn.Module):
         patch_size:  spatial patch for local distribution matching
     """
 
-    def __init__(self, num_freqs: int = 32, max_freq: float = 1.0, patch_size: int = 16):
+    def __init__(self, num_freqs: int = 32, max_freq: float = 1.0, patch_size: int = 16,
+                 max_patches: int = 64):
         super().__init__()
         self.patch_size = patch_size
+        self.max_patches = max_patches
         # Fixed test frequencies ω ∈ [-max_freq, max_freq]
         freqs = torch.linspace(-max_freq, max_freq, num_freqs)
         self.register_buffer('freqs', freqs)
@@ -101,6 +103,13 @@ class CharacteristicFunctionConsistencyLoss(nn.Module):
         nH, nW = pred_patches.shape[2], pred_patches.shape[3]
         pred_flat = pred_patches.reshape(B * nH * nW, -1)      # (B*nH*nW, C*p*p)
         tgt_flat = tgt_patches.reshape(B * nH * nW, -1)
+
+        # Subsample patches to bound compute — random sample changes each step
+        total_patches = pred_flat.shape[0]
+        if total_patches > self.max_patches:
+            idx = torch.randperm(total_patches, device=pred_flat.device)[:self.max_patches]
+            pred_flat = pred_flat[idx]
+            tgt_flat = tgt_flat[idx]
 
         # Compute ECF for each patch
         pred_ecf = self.empirical_cf(pred_flat)

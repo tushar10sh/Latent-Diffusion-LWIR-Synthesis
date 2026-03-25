@@ -346,12 +346,19 @@ class DiTTrainer:
             self._snr = snr
             print("[DiT] DDPM/DDIM scheduler")
 
-        # ── Auxiliary losses (latent-space) ───────────────────────
-        self.cfc_loss      = CharacteristicFunctionConsistencyLoss(
-                                 num_freqs=32, patch_size=8).to(self.device)
-        self.spectral_loss = SpectralConsistencyLoss().to(self.device)
-        self.lambda_cfc      = config.get('lambda_cfc', 0.1)
-        self.lambda_spectral = config.get('lambda_spectral', 0.05)
+        # ── Auxiliary losses ───────────────────────────────────────
+        # CFC and spectral losses are DISABLED in latent space because:
+        #   1. Latent values are N(0,1), not bounded to [-1,1] like pixels.
+        #      The x0_pred clamp to [-1,1] destroys ~32% of latent values,
+        #      making the loss compare clamped predictions vs unclamped targets.
+        #   2. CFC (characteristic function matching) and spectral (PSD matching)
+        #      were designed for pixel-space thermal distributions — they have
+        #      no physical meaning in the abstract latent space.
+        #   3. The primary FM/DDPM loss is sufficient and well-calibrated for
+        #      latent diffusion. SD, DALL-E, and all production LDMs use only
+        #      the primary loss in latent space.
+        self.lambda_cfc      = 0.0
+        self.lambda_spectral = 0.0
 
         # ── Planck ratio loss (pixel-space, applied on decoded output) ──
         self.lambda_planck = config.get('planck', {}).get('lambda_planck', 0.0)
@@ -475,20 +482,16 @@ class DiTTrainer:
                     self.scheduler.sqrt_alphas_cumprod, t_int, z0.shape)
                 sqrt_1ma = self.scheduler._extract(
                     self.scheduler.sqrt_one_minus_alphas_cumprod, t_int, z0.shape)
-                z0_pred  = ((zt - sqrt_1ma * noise_pred) / (sqrt_a + 1e-8)).clamp(-1, 1)
+                z0_pred  = (zt - sqrt_1ma * noise_pred) / (sqrt_a + 1e-8)
                 loss_dict = {'ddpm_mse': primary_loss.item()}
 
-            # ── Latent-space auxiliary losses ─────────────────────────
-            cfc  = self.cfc_loss(z0_pred, z0)
-            spec = self.spectral_loss(z0_pred, z0)
-            total = primary_loss + self.lambda_cfc * cfc + self.lambda_spectral * spec
-            loss_dict.update({'cfc': cfc.item(), 'spectral': spec.item()})
+            total = primary_loss
 
-            # ── Planck ratio loss (pixel space) ───────────────────────
+            # ── Planck ratio loss (pixel space, optional) ─────────────
             if self.planck_loss is not None and self.lambda_planck > 0:
                 # Decode z0_pred to pixel space (frozen VAE decoder)
                 with torch.no_grad():
-                    pred_lwir_px = self.vae.decode(z0_pred.float())
+                    pred_lwir_px = self.vae.decode(z0_pred.detach().float())
                 planck_out = self.planck_loss(pred_lwir_px, mwir)
                 planck_l   = planck_out['planck_loss']
                 total      = total + self.lambda_planck * planck_l
@@ -560,11 +563,12 @@ class DiTTrainer:
                 # ── Visualisation ──
                 if (self.global_step + 1) % self._vis_every == 0:
                     self.dit.eval()
-                    vis_psnr = self.visualizer.save_both(
-                        step=self.global_step + 1,
-                        generate_fn=self._generate_fn,
-                        output_dir=self.output_dir,
-                    )
+                    with self.ema.average_parameters():
+                        vis_psnr = self.visualizer.save_both(
+                            step=self.global_step + 1,
+                            generate_fn=self._generate_fn,
+                            output_dir=self.output_dir,
+                        )
                     self.dit.train()
                     if self.visualizer.is_best(vis_psnr.get('test'), 'test'):
                         self._save('best')
@@ -577,11 +581,12 @@ class DiTTrainer:
         self._save('final')
         # Final visualisation pass
         self.dit.eval()
-        self.visualizer.save_both(
-            step=self.global_step + 1,
-            generate_fn=self._generate_fn,
-            output_dir=self.output_dir,
-        )
+        with self.ema.average_parameters():
+            self.visualizer.save_both(
+                step=self.global_step + 1,
+                generate_fn=self._generate_fn,
+                output_dir=self.output_dir,
+            )
         self.dit.train()
 
     # ─── Generate function for Visualizer ────────────────────────
@@ -632,21 +637,22 @@ class DiTTrainer:
         self.dit.eval()
         psnr_vals, ssim_vals, planck_errs = [], [], []
 
-        for i, batch in enumerate(self.val_loader):
-            if i >= 4:
-                break
-            mwir = batch['mwir'][:4].to(self.device)
-            lwir = batch['lwir'][:4].to(self.device)
+        with self.ema.average_parameters():
+            for i, batch in enumerate(self.val_loader):
+                if i >= 4:
+                    break
+                mwir = batch['mwir'][:4].to(self.device)
+                lwir = batch['lwir'][:4].to(self.device)
 
-            gen_lwir = self._generate_fn(mwir).to(self.device)
+                gen_lwir = self._generate_fn(mwir).to(self.device)
 
-            for j in range(gen_lwir.shape[0]):
-                psnr_vals.append(psnr(gen_lwir[j:j+1], lwir[j:j+1]))
-                ssim_vals.append(ssim(gen_lwir[j:j+1], lwir[j:j+1]))
+                for j in range(gen_lwir.shape[0]):
+                    psnr_vals.append(psnr(gen_lwir[j:j+1], lwir[j:j+1]))
+                    ssim_vals.append(ssim(gen_lwir[j:j+1], lwir[j:j+1]))
 
-            if self.planck_loss is not None:
-                d = self.planck_loss.diagnostics(gen_lwir, mwir, lwir)
-                planck_errs.append(d.get('bt_mae_pred_K', 0.0))
+                if self.planck_loss is not None:
+                    d = self.planck_loss.diagnostics(gen_lwir, mwir, lwir)
+                    planck_errs.append(d.get('bt_mae_pred_K', 0.0))
 
         self.dit.train()
         import numpy as np

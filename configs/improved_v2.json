@@ -48,7 +48,7 @@
   "weight_decay": 1e-4,
   "batch_size": 8,
   "num_workers": 4,
-  "total_steps": 2000,
+  "total_steps": 200000,
   "warmup_steps": 1000,
   "ema_decay": 0.9999,
   "use_amp": false,
@@ -57,8 +57,8 @@
   "use_lcn": false,
 
   "log_every": 50,
-  "val_every": 200,
-  "save_every": 500,
+  "val_every": 2000,
+  "save_every": 5000,
   "val_ddim_steps": 20,
 
   "_tuning_notes": {
